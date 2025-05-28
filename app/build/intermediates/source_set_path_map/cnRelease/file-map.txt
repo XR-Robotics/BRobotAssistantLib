@@ -1,0 +1,10 @@
+com.picovr.robotassistantlib.app-cn-0 /Users/bytedance/VO/QY/BRobotAssistantLib/app/build/generated/res/pngs/cn/release
+com.picovr.robotassistantlib.app-cn-1 /Users/bytedance/VO/QY/BRobotAssistantLib/app/build/generated/res/resValues/cn/release
+com.picovr.robotassistantlib.app-cn-2 /Users/bytedance/VO/QY/BRobotAssistantLib/app/build/generated/res/rs/cn/release
+com.picovr.robotassistantlib.app-mergeCnReleaseResources-3 /Users/bytedance/VO/QY/BRobotAssistantLib/app/build/intermediates/incremental/cnRelease/mergeCnReleaseResources/merged.dir
+com.picovr.robotassistantlib.app-mergeCnReleaseResources-4 /Users/bytedance/VO/QY/BRobotAssistantLib/app/build/intermediates/incremental/cnRelease/mergeCnReleaseResources/stripped.dir
+com.picovr.robotassistantlib.app-merged_res-5 /Users/bytedance/VO/QY/BRobotAssistantLib/app/build/intermediates/merged_res/cnRelease
+com.picovr.robotassistantlib.app-cn-6 /Users/bytedance/VO/QY/BRobotAssistantLib/app/src/cn/res
+com.picovr.robotassistantlib.app-cnRelease-7 /Users/bytedance/VO/QY/BRobotAssistantLib/app/src/cnRelease/res
+com.picovr.robotassistantlib.app-main-8 /Users/bytedance/VO/QY/BRobotAssistantLib/app/src/main/res
+com.picovr.robotassistantlib.app-release-9 /Users/bytedance/VO/QY/BRobotAssistantLib/app/src/release/res
