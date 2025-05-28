@@ -1,0 +1,29 @@
+pluginManagement {
+    repositories {
+        mavenLocal()  // 本地仓库
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        mavenLocal()  // 本地仓库
+        maven {
+            allowInsecureProtocol = true
+            url 'http://maven.byted.org/repository/android_public/'
+        }
+        google()
+        mavenCentral()
+        maven {
+            url 'https://artifacts-cn-beijing.volces.com/repository/picoxrtob'
+        }
+
+    }
+}
+rootProject.name = "BRobotAssistantLib"
+include ':app'
+include ':fbolibrary'
+// include ':capturelib'
+include ':localmaven'

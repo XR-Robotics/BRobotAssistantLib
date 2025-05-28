@@ -1,0 +1,4 @@
+#格式请遵循 src:target
+#针对 lib:u3d
+app/build/outputs/aar/robotassistant_lib-cn-release.aar:libCopeTmp/cn/robotassistant_lib.aar
+app/build/outputs/aar/robotassistant_lib-i18n-release.aar:libCopeTmp/i18n/robotassistant_lib.aar

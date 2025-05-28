@@ -1,0 +1,437 @@
+//BRobotAssistant编译的流程是：Android工程导出arr到unity，uity出apk
+//注意事项：1、BRobotAssistantLib仓库的master分支里的jenkinsfile决定了jenkins任务的流程，修改别的地方的文件无效
+//2、BRobotAssistantU3d的master分支，必须含有Assets/Editor/ProjectBuild.cs和build_unity_android.py文件；别的分支没有这两个文件会从master分支获取；有文件就直接使用
+//3、BRobotAssistantLib仓库的copy-list.txt文件是指定lib编译后的结果物copy到u3d的位置；别的分支没有这个文件会从master分支获取；有文件就直接使用
+
+pipeline {
+    //jenkins任务启动需要填写的参数
+    parameters{
+        gitParameter(branch: '', branchFilter: '.*', defaultValue: 'origin/master', description: '请选择你要编译的代码分支', name: 'BUILD_BRANCH', quickFilterEnabled: true, selectedValue: 'NONE', sortMode: 'NONE', tagFilter: '*', type: 'PT_BRANCH')
+        booleanParam(defaultValue: false, description: '选中这个选项表示不管代码是否变化，都重新编译apk。默认如果代码没有变化，则不重新编译。', name: 'APK_FORCE_RELEASE')
+        string(defaultValue: 'BRobotAssistant', description: '模块名称，用于生成android.mk中的apk名称，一般不需要修订。', name: 'APK_MODULE_NAME', trim: true)
+        string(defaultValue: 'ssh://stone-review/pico/Enterprise/app/BRobotAssistantBin2', description: '将编译后的apk自动push到哪个仓库', name: 'APK_PUSH_URL', trim: true)
+        string(defaultValue: '', description: '将编译后的apk自动push到仓库的哪个分支，一般填写对应的项目manifest文件中配置的BIN仓库的分支地址，比如master、xx-rom等', name: 'APK_PUSH_BRANCH', trim: true)
+        string(defaultValue: '29', description: 'jenkins任务默认需要的参数；smartisanos sdk版本号，这个job不支持这个参数', name: 'APK_SDK_VERSION', trim: true)
+        string(defaultValue: '', description: '请填写https://stone-review.byted.org/上的Gerrit change 链接；多个change请使用英文空格分隔', name: 'APK_GERRIT_PATCH', trim: true)
+        string(defaultValue: 'wangchuang.1113@bytedance.com', description: '编译完成后的邮件通告人员，多个人员请用空格分隔', name: 'BUILD_MAIL_TO', trim: true)
+        string(defaultValue: 'neo3-userdebug,neo3-user', description: '需要使用的签名id，使用英文逗号分割', name: 'APK_SIGN_KEYS', trim: true)
+        string(defaultValue: 'platform', description: 'apk签名类型', name: 'APK_KEY_TYPE', trim: true)
+        string(defaultValue: '/mnt/flash/release_apk/build_outputs/BRobotAssistant', description: '该参数为自动job赋值使用，个人手动启动禁止修改', name: 'APP_RELEASE_PATH', trim: true)
+    }
+    //编译使用的服务器
+    agent { label 'ubuntu-unity' }
+    options {
+        //不允许并发构建
+        disableConcurrentBuilds()
+        //保留3天的log
+        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '3', numToKeepStr: '')
+    }
+    //用到的常量
+    environment {
+        ANDROID_HOME = "/home/smartcm/android-sdk-linux"
+        ANDROID_NDK_HOME = "/home/smartcm/android-sdk-linux/ndk-bundle"
+        //使用PATH会影响windows机器环境
+        LINUX_PATH = "/home/smartcm/.local/bin:/home/smartcm/perl5/bin:/usr/lib/jvm/java-11-openjdk-amd64/bin:/home/smartcm/system-config/bin:/usr/local/bin:/usr/bin:/usr/games:/sbin:/usr/sbin:/usr/local/sbin:/home/smartcm/src/github/smartcm:/snap/bin:/bin:/home/smartcm/external/local/bin"
+
+        LIB_GIT = "pico/Enterprise/app/BRobotAssistantLib"
+        U3D_GIT = "pico/Enterprise/app/BRobotAssistantU3d"
+        LIB_SOURCE_URL = "smartisan:${LIB_GIT}"
+        U3D_SOURCE_URL = "smartisan:${U3D_GIT}"
+        GIT_BRANCH_NAME = sh(script: 'echo $BUILD_BRANCH | sed "s#origin/##"', returnStdout:true).trim()
+        GIT_BRANCH_NAME_RE = sh(script: 'echo $BUILD_BRANCH | sed "s#origin/##" | sed "s#/#%#g"', returnStdout:true).trim()
+        GIT_BRANCH_NAME_FOR = sh(script: 'echo $BUILD_BRANCH | sed "s#origin/##" | sed "s#/#_#g"', returnStdout:true).trim()
+
+        APK_PUSH_SUBDIR = "cn,i18n"
+        BUILD_LAST_PATH = "/mnt/flash/ci/${JOB_NAME}/${GIT_BRANCH_NAME_RE}-PushToBr-${GIT_BRANCH_NAME_FOR}"
+        BUILD_USER_ID = get_build_user_and_type()
+        MYSQL_CMD_HEAD = "mysql --defaults-file=~/.ssh/mysql-cmbuild.cnf -B -s cmbuild -e"
+        OUTPUT = "build/dist/"
+        PUSH_PROJECT = sh(script: 'echo $APK_PUSH_URL | sed "s#ssh://smartisan/##" | sed "s#ssh://stone-review/##"', returnStdout:true).trim()
+        SEND_MSG = "/home/smartcm/src/github/smartcm/mail-cms -i --lark-only -n sendRichMessageForGroupName "
+        SMARTCM_EXTRA_MAIL = "$BUILD_MAIL_TO ${BUILD_USER_ID}@bytedance.com"
+        TOS_PATH = "tos://pico-cm-artifact/app/${APK_MODULE_NAME}/"
+        TODAY = sh(script: 'date +%Y%m%d', returnStdout:true).trim()
+    }
+    stages {
+        //处理一些参数
+        stage('pre_parameter') {
+            steps {
+                script {
+                    currentBuild.displayName = "${BUILD_NUMBER}-${GIT_BRANCH_NAME}"
+                    if ( APK_PUSH_BRANCH == ''){
+                        echo "======== INFO: APK_PUSH_BRANCH为空,不会向bin2仓库推送apk文件 ========"
+                    }else{
+                        if ( APK_PUSH_BRANCH != GIT_BRANCH_NAME ){
+                            error "======== ERROR: APK_PUSH_BRANCH需要和BUILD_BRANCH一致! ========"
+                        }
+                    }
+                    if ( APK_GERRIT_PATCH == '' ){
+                        env.pdm_repo = 'daily-build'
+                        env.lib_sha1_patchs = ''
+                        env.u3d_sha1_patchs = ''
+                    }else{
+                        env.APK_PUSH_BRANCH = ''
+                        env.pdm_repo = 'diy-build'
+                        env.lib_sha1_patchs = split_patchs_2_sha1(LIB_GIT)
+                        env.u3d_sha1_patchs = split_patchs_2_sha1(U3D_GIT)
+                        echo lib_sha1_patchs
+                        echo u3d_sha1_patchs
+                        echo "======== INFO: 带Gerrit change编译不会向Bin2仓库push 只上传到pdm ========"
+                    }
+                    env.PDM_URL = "http://pico-pdm.bytedance.net/build?repo=${pdm_repo}&project=PUI&product=${APK_MODULE_NAME}"
+                }
+            }
+        }
+        //在linux服务器上处理 和mysql的交互，计算版本等相关内容
+        stage('pre_lib_build') {
+            steps {
+                script {
+                    sh label: '', script: 'git checkout remotes/origin/$GIT_BRANCH_NAME'
+                    if ( lib_sha1_patchs.trim() != "" ){
+                        sh'''
+                        for commitid in ${lib_sha1_patchs}
+                        do
+                            git fetch --no-tags --depth=3 origin ${commitid} && git cherry-pick ${commitid}
+                        done
+                        '''
+                    }
+                    //计算lib部分是否需要编译
+                    env.last_lib_commit = sh(script: 'git log -1 --pretty=%H', returnStdout:true).trim()
+                    echo last_lib_commit
+                    def exists1 = fileExists "${BUILD_LAST_PATH}/build.last.good"
+                    if (exists1) {
+                        env.last_u3d_good_commit = sh(script: 'head -n 1 ${BUILD_LAST_PATH}/build.last.good', returnStdout:true).trim()
+                        echo last_u3d_good_commit
+                    }else{
+                        env.last_u3d_good_commit = ""
+                    }
+                    sh(script: "tosutil cp ${TOS_PATH}lib-outputs/${last_lib_commit}.zip ${last_lib_commit}.zip", returnStatus:true)
+                    def exists2 = fileExists "${last_lib_commit}.zip"
+                    if (exists2) {
+                        echo "tos上可以找到LIB产物"
+                        env.last_lib_good_commit = last_lib_commit
+                        env.BUILD_LIB_FLAG = 'false'
+                    }else{
+                        env.BUILD_LIB_FLAG = 'true'
+                    }
+                    if ( APK_FORCE_RELEASE == "true" ){
+                        env.BUILD_LIB_FLAG = 'true'
+                    }
+                    if (BUILD_LIB_FLAG == "true"){
+                        //查看是否有编译需要的文件，没有就从master分支取
+                        def exists0 = fileExists "copy-list.txt"
+                        if (exists0) {
+                            echo 'copy-list.txt exist!'
+                        }else{
+                            sh label: '', script: 'git checkout origin/master copy-list.txt'
+                            sh label: '', script: 'git reset'
+                        }
+                    }
+                }
+            }
+        }
+        stage('lib_build') {
+            when {
+                environment name: 'BUILD_LIB_FLAG', value: 'true'
+            }
+            environment {
+                ANDROID_HOME = "$ANDROID_HOME"
+                ANDROID_NDK_HOME = "$ANDROID_NDK_HOME"
+                PATH = "$LINUX_PATH"
+            }
+            steps {
+                script {
+                    //编译lib
+                    env.lib_build_cmd = sh(script: "grep '^task ' app/build.gradle | awk -F '[()]' '{print \$1}' | sed 's/^task //'", returnStdout:true).trim()
+                    if ( lib_build_cmd == "" ){
+                        env.lib_build_cmd = "createReleaseArr"
+                    }
+                    sh(script: 'bash ./gradlew --no-daemon ${lib_build_cmd}', returnStdout:true).trim()
+                    sh(script: 'rm -rf output-dist', returnStatus:true)
+                    //生成文件夹
+                    sh(script: '''grep -v '^#' copy-list.txt | awk -F: '{print "output-dist/"$2}' | xargs dirname | sort | uniq | xargs mkdir -p ''', returnStdout:true).trim()
+                    //按copy-list里的target目录结构copy好，后续直接解压到u3d里
+                    sh(script: '''grep -v '^#' copy-list.txt | awk -F: '{print "cp -rf "$1,"output-dist/"$2}' | bash''', returnStdout:true).trim()
+                    exist = sh(script: 'find ./output-dist/ -type f | wc -l ', returnStdout:true).trim()
+                    //没有文件，意味着编译失败了
+                    if (exist  == '0' ){
+                        error "======== LIB GRADLE 编译失败 ========"
+                    }
+                    dir('output-dist'){
+                        sh(script: "zip -r ${last_lib_commit}.zip * ", returnStdout:true).trim()
+                        sh(script: "tosutil cp ${last_lib_commit}.zip ${TOS_PATH}lib-outputs/${last_lib_commit}.zip", returnStdout:true).trim()
+                    }
+                }
+            }
+        }
+        stage('u3d_build') {
+            steps {
+                script {
+                    //计算u3d部分是否需要编译
+                    sh(script: 'rm -rf U3D', returnStatus:true)
+                    sh ("""
+                    mkdir U3D
+                    cd U3D
+                    git init
+                    git remote add origin ${U3D_SOURCE_URL}
+                    git fetch --no-tags --depth=1 origin +refs/heads/${GIT_BRANCH_NAME}:refs/remotes/origin/${GIT_BRANCH_NAME}
+                    git checkout remotes/origin/$GIT_BRANCH_NAME
+                    """)
+                    dir('U3D') {
+                        if ( u3d_sha1_patchs.trim() != "" ){
+                        sh'''
+                        for commitid in ${u3d_sha1_patchs}
+                        do
+                            git fetch --no-tags --depth=3 origin ${commitid} && git cherry-pick ${commitid}
+                        done
+                        '''
+                        }
+                        env.last_u3d_commit = sh(script: 'git log -1 --pretty=%H', returnStdout:true).trim()
+                        if ( last_u3d_commit != last_u3d_good_commit){
+                            env.BUILD_U3D_FLAG = 'true'
+                        }else{
+                            env.BUILD_U3D_FLAG = 'false'
+                        }
+                        if ( BUILD_LIB_FLAG == "true" ){
+                            env.BUILD_U3D_FLAG = 'true'
+                        }
+                        if ( APK_FORCE_RELEASE == "true" ){
+                            env.BUILD_U3D_FLAG = 'true'
+                        }
+                        if ( BUILD_U3D_FLAG == 'true' ){
+                            def exists1 = fileExists 'build_unity_android.py'
+                            if (exists1) {
+                                echo 'build_unity_android.py exist!'
+                            } else {
+                                sh(script: "git checkout origin/master build_unity_android.py", returnStatus:true)
+                            }
+                            def exists2 = fileExists 'Assets/Editor/ProjectBuild.cs'
+                            if (exists2) {
+                                echo 'ProjectExport.cs exist!'
+                            } else {
+                                sh(script: "git checkout origin/master Assets/Editor/ProjectBuild.cs", returnStatus:true)
+                            }
+                            //get versionname and caculate versioncode
+                            //从代码的ProjectSettings/ProjectSettings.asset里提取版本号
+                            env.versionname = sh(script: 'grep "bundleVersion:" ProjectSettings/ProjectSettings.asset | sed "s#bundleVersion:##"', returnStdout:true).trim()
+                            echo versionname
+                            env.versioncode = getVersionCode()
+                            echo versioncode
+                            env.buildTag = "${versionname}#12345-${TODAY}"
+                            echo buildTag
+                            env.buildRevision = "${versionname}_${versioncode}-${TODAY}"
+                            echo buildRevision
+                            //scmVars.GIT_COMMIT scmVars.GIT_PREVIOUS_SUCCESSFUL_COMMIT
+                            env.toslinkfile = "tos://pico-cm-artifact/app/${APK_MODULE_NAME}/${buildRevision}/toslinks.txt"
+                            env.UNITY_VERSION = sh(script: "grep 'm_EditorVersion:' ProjectSettings/ProjectVersion.txt | awk -F ':' '{print \$2}'", returnStdout:true).trim()
+                            env.UNITY_TOOL = "$HOME/Unity/Hub/Editor/${UNITY_VERSION}/Editor/Unity"
+                            echo UNITY_TOOL
+                            exists0 = fileExists UNITY_TOOL
+                            if (exists0) {
+                                echo "工具 $UNITY_TOOL exist!"
+                            }else{
+                                //没有对应的unity工具，尝试下载安装
+                                build job: 'auto-install-unity', parameters: [string(name: 'UNITY_VERSION', value: "${UNITY_VERSION}"), string(name: 'SERVER_NAME', value: "${NODE_NAME}")]
+                            }
+                            //lib结果覆盖
+                            sh(script: "tosutil cp ${TOS_PATH}lib-outputs/${last_lib_commit}.zip ${last_lib_commit}.zip", returnStdout:true).trim()
+                            sh(script: "unzip -o ${last_lib_commit}.zip", returnStdout:true).trim()
+
+                            timeout(time: 50, unit: 'MINUTES') {
+                                //unity编译
+                                def ret = sh(script: "python build_unity_android.py $UNITY_TOOL $APK_MODULE_NAME ProjectBuild.BuildForAndroid", returnStatus:true)
+                                //build.log展示在jenkins job里
+                                if(ret == 0){
+                                    archiveArtifacts allowEmptyArchive: true, artifacts: 'build.log', followSymlinks: false
+                                    echo "======== INFO: UNITY BUILD SUCCESS ========"
+                                }else{
+                                    archiveArtifacts allowEmptyArchive: true, artifacts: 'build.log', followSymlinks: false
+                                    error "======== UNITY BUILD FAILED! ========"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        //更新Pdm里的数据
+        stage('update_pdm') {
+            when {
+                environment name: 'BUILD_U3D_FLAG', value: 'true'
+            }
+            steps {
+                script {
+                    env.build_index = insert_DB()
+                    echo build_index
+                    env.buildTag = "${versionname}#${build_index}-${TODAY}"
+                    echo buildTag
+                    currentBuild.displayName = "${BUILD_NUMBER}-${GIT_BRANCH_NAME}-${buildTag}"
+                    update_pdm_str = """'{"buildRevision":"${buildRevision}","deleteFile":false,"project":"PUI","repo": "${pdm_repo}", "uploaded": 1,"product":"${APK_MODULE_NAME}","branch":"${GIT_BRANCH_NAME}","buildTag":"${buildTag}"}'"""
+                    sh("""
+                    curl -X PUT "http://pico-pdm-be.bytedance.net/api/v1/buildEntity"  -H "accept: application/json" -H "Content-Type: application/json" -d ${update_pdm_str}
+                    """)
+                    if ( lib_sha1_patchs.trim() != "" ){
+                        sh(script: "tosutil rm -f ${TOS_PATH}lib-outputs/${last_lib_commit}.zip", returnStatus:true)
+                    }
+                    if ( APK_GERRIT_PATCH.trim() != '' ){
+                        update_cmd = "update build_pico_apps set build_label='$APK_GERRIT_PATCH' where id=$build_index"
+                        sh label: "", script: "$MYSQL_CMD_HEAD \"$update_cmd\""
+                    }
+                }
+            }
+        }
+        //编译后 apk写到Bin2仓库 update相关DB数据 用于Pdm展示
+        stage('insert_bin2'){
+            when {
+                allOf{
+                    environment name: 'BUILD_U3D_FLAG', value: 'true'
+                    expression { env.APK_PUSH_BRANCH != '' }
+                }
+            }
+            environment {
+                PATH = "$LINUX_PATH"
+            }
+            steps {
+                script {
+                    echo "====update DB===="
+                    sh label: '', script: 'tosutil cp $toslinkfile ./toslinks.txt'
+
+                    env.Bin2_commit_message = "sdk_version:29@@current_build_commit:${LIB_GIT}+${last_lib_commit},${U3D_GIT}+${last_u3d_commit}"
+                    env.current_month = sh(script: 'date +%Y%m', returnStdout:true).trim()
+                    env.push_branch = sh(script: 'echo $APK_PUSH_BRANCH | sed "s#origin/##" | sed "s#/#%#g"', returnStdout:true).trim()
+                    env.time_timestamp = sh(script: 'date +%s', returnStdout:true).trim()
+                    if ( env.APK_PUSH_SUBDIR ) {
+                        env.Bin2_apk_LINK = sh(script: '''
+                        for j in debug release
+                        do
+                            for i in ${APK_PUSH_SUBDIR/,/ }
+                            do
+                                mnt_str="/mnt/flash/release_apk/all_apks/${PUSH_PROJECT}/${GIT_BRANCH_NAME_RE}/sdk_/push_to_${push_branch}/${current_month}/${i}/${j}/${APK_MODULE_NAME}_${last_u3d_commit}_${time_timestamp}.apk"
+                                link_str=$(cat toslinks.txt | tr "," "\n" | grep -E "/app/${APK_MODULE_NAME}_.*_$i-release.apk" | head -n 1)
+                                all_str="${i}/${j}/${APK_MODULE_NAME}.apk#${mnt_str}#${link_str},${all_str}"
+                            done
+                        done
+                        echo $all_str
+                        ''', returnStdout:true).trim()
+                    }else{
+                        debug_mnt = "/mnt/flash/release_apk/all_apks/${PUSH_PROJECT}/${GIT_BRANCH_NAME_RE}/sdk_/push_to_${push_branch}/${current_month}/debug/${APK_MODULE_NAME}_${last_u3d_commit}_${time_timestamp}.apk"
+                        release_mnt = "/mnt/flash/release_apk/all_apks/${PUSH_PROJECT}/${GIT_BRANCH_NAME_RE}/sdk_/push_to_${push_branch}/${current_month}/release/${APK_MODULE_NAME}_${last_u3d_commit}_${time_timestamp}.apk"
+                        debug_link = sh(script: 'cat toslinks.txt | tr "," "\n" | grep "\\-debug.apk" | grep "/app/${APK_MODULE_NAME}_" | head -n 1', returnStdout:true).trim()
+                        release_link = sh(script: 'cat toslinks.txt | tr "," "\n" | grep "\\-release.apk" | grep "/app/${APK_MODULE_NAME}_" | head -n 1', returnStdout:true).trim()
+                        env.Bin2_apk_LINK = "debug/${APK_MODULE_NAME}.apk#${debug_mnt}#${debug_link},release/${APK_MODULE_NAME}.apk#${release_mnt}#${release_link}"
+                    }
+                    echo "==== PUSH PARAMETERS ===="
+                    echo Bin2_commit_message
+                    echo Bin2_apk_LINK
+                    sh("""
+                        tosutil cp tos://pico-cm-artifact/app/push_apk_to_Bin2.sh push_apk_to_Bin2.sh
+                        chmod 755 push_apk_to_Bin2.sh
+                    """)
+                    sh(script: "sed -i 's#,#\\n#g' toslinks.txt && echo '' >> ${WORKSPACE}/toslinks.txt", returnStatus:true)
+                    sh(script: 'source ./push_apk_to_Bin2.sh -u "$APK_PUSH_URL" -b "$APK_PUSH_BRANCH" -l "$Bin2_apk_LINK" -m "$Bin2_commit_message" && echo "$PUSH_COMMIT_ID" >> ${WORKSPACE}/toslinks.txt', returnStdout:true).trim()
+                    PUSH_COMMIT_ID = sh(script: 'tail -n1 ./toslinks.txt | grep -o -E "[0-9a-z]{40}"', returnStdout:true).trim()
+                    sh("""
+                        echo ${BUILD_LAST_PATH}
+                        mkdir -p ${BUILD_LAST_PATH}
+                        echo "$last_u3d_commit" > ${BUILD_LAST_PATH}/build.last.good
+                    """)
+
+                    update_cmd = "update build_pico_apps set push_url='$APK_PUSH_URL', push_branch='$APK_PUSH_BRANCH', push_commit_id='$PUSH_COMMIT_ID' where id=$build_index"
+
+                    echo update_cmd
+                    sh label: "", script: "$MYSQL_CMD_HEAD \"$update_cmd\""
+                    show_cmd = "select * from build_pico_apps where id=$build_index \\G"
+                    echo show_cmd
+                    sh label: "", script: "$MYSQL_CMD_HEAD \"$show_cmd\""
+                }
+            }
+        }
+    }
+    //发送飞书消息
+    post {
+        success {
+            script {
+                if ( BUILD_U3D_FLAG == "true"){
+                    sh("""
+                    source ~/.profile
+
+cat <<EOF | $SEND_MSG "[$TODAY] Build Success for $JOB_NAME #$BUILD_ID"
+The build branch is: $GIT_BRANCH_NAME
+The apk push branch is: $APK_PUSH_BRANCH
+unity build log is (if exist): ${BUILD_URL}/artifact/build.log
+build log is: ${BUILD_URL}/console
+构建版本 is: $buildRevision
+Please get apk at: $PDM_URL
+EOF
+                    """)
+                }
+            }
+        }
+        failure {
+            sh("""
+            source ~/.profile
+
+cat <<EOF | $SEND_MSG "[$TODAY] Build Failed for $JOB_NAME #$BUILD_ID"
+The build branch is: $GIT_BRANCH_NAME
+The apk push branch is: $APK_PUSH_BRANCH
+unity build log is (if exist): ${BUILD_URL}/artifact/build.log
+请排查 jenkins log 错误原因 ${BUILD_URL}/console
+EOF
+            """)
+        }
+    }
+}
+//获取启动jenkins job 人员的邮箱前缀
+def get_build_user_and_type(){
+    wrap([$class: 'BuildUser']) {
+        return "${env.BUILD_USER_ID}"
+    }
+}
+//通过versionname计算versioncode versioncode不可重复
+def getVersionCode(){
+    selectcmd = "select max(picobuild_versioncode) from build_pico_apps where module_name='$APK_MODULE_NAME' and version_name='$versionname'"
+    build_base_picobuild_versioncode = sh(script: "$MYSQL_CMD_HEAD \"${selectcmd}\"", returnStdout:true).trim()
+    if (build_base_picobuild_versioncode != 'NULL'){
+        //( build_base_picobuild_versioncode.toInteger() > 0 )
+        versioncode = sh(script: "expr ${build_base_picobuild_versioncode} + 1", returnStdout:true).trim()
+    }else{
+        left_num = sh(script: 'echo "$versionname" | cut -d "." -f 1 | xargs printf "%02d\n" | sed "s#^0##" ', returnStdout:true).trim()
+        mid_num = sh(script: 'echo "$versionname" | cut -d "." -f 2 | xargs printf "%03d\n"', returnStdout:true).trim()
+        right_num = sh(script: 'echo "$versionname" | cut -d "." -f 3 | xargs printf "%02d\n"', returnStdout:true).trim()
+        versioncode = "${left_num}${mid_num}${right_num}000"
+    }
+    echo versioncode
+    return versioncode
+}
+//插入DB，获取该条数据的id 用于pdm上的“构建标识”
+def insert_DB(){
+    deploy_time = sh(script: 'date +%Y-%m-%d-%H:%M:%S', returnStdout:true).trim()
+    select_cmd = "select id from build_pico_apps where module_name='$APK_MODULE_NAME' and picobuild_versioncode='$versioncode' and build_commit_id='$last_lib_commit' and unity_commit_id='$last_u3d_commit'"
+    echo select_cmd
+    insert_cmd = "insert into build_pico_apps (module_name,picobuild_versioncode,version_name,source_url,source_branch,build_commit_id,sdk_version,deploy_url,deploy_time,deployer,is_unity,unity_url,unity_commit_id) values('$APK_MODULE_NAME', '$versioncode', '$versionname', '$LIB_SOURCE_URL', '$BUILD_BRANCH', '$last_lib_commit', '29', '$BUILD_URL', '$deploy_time', '$BUILD_USER_ID',1, '$U3D_SOURCE_URL', '$last_u3d_commit')"
+    echo insert_cmd
+    build_index = sh(script: "$MYSQL_CMD_HEAD \"$select_cmd\"", returnStdout:true).trim()
+    if ( build_index == "" ){
+        sh label: "", script: "$MYSQL_CMD_HEAD \"$insert_cmd\""
+        build_index = sh(script: "$MYSQL_CMD_HEAD \"$select_cmd\"", returnStdout:true).trim()
+    }
+    echo build_index
+    return build_index
+}
+def split_patchs_2_sha1(git_repo){
+    echo "==== split_patchs_2_sha1 ==== "
+    echo git_repo
+    echo APK_GERRIT_PATCH
+    env.project_name = git_repo
+    patchs_commit = sh(script: '''
+    for patch in ${APK_GERRIT_PATCH}
+    do
+        patch=$(echo $patch | sed -n 's#\\(^https://.*+/\\)\\([0-9]*\\)\\(.*\\)#\\1\\2#p')
+        if echo $patch | grep -q "${project_name}" ;then
+            patch=$(echo $patch | awk -F'/' '{print $NF}')
+            ssh -n stone-review gerrit query --current-patch-set project:${project_name} $patch | grep 'revision:' | awk -F: '{print $NF}'
+        fi
+    done
+    ''', returnStdout:true)
+    return patchs_commit
+}
