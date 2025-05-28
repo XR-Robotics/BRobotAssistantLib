@@ -1,0 +1,70 @@
+plugins {
+    id 'com.android.library'
+}
+
+android {
+    namespace 'com.picovr.robotassistantlib'
+    compileSdk 31
+
+    defaultConfig {
+      //  applicationId "com.picovr.robotassistantlib"
+        minSdk 30
+        targetSdk 31
+        versionCode 1
+        versionName "1.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        main {
+            storeFile rootProject.file("tools/picovros.keystore")
+            storePassword PlatformDebugPassword
+            keyAlias PlatformDebugkeyAlias
+            keyPassword PlatformDebugkeyPassword
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.main
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+
+        debug{
+            signingConfig signingConfigs.main
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    flavorDimensions "version"
+    productFlavors {
+        cn {
+            dimension "version"
+        }
+
+        i18n {
+            dimension "version"
+        }
+    }
+}
+
+archivesBaseName = "robotassistant_lib"
+
+dependencies {
+    implementation fileTree(include: ['*.jar', '*.aar'], dir: 'libs')
+    // 添加编译好的aar文件（需要先将fbolibrary生成的aar复制到app/libs目录）
+    implementation 'com.pxr:capturelib:0.0.7'
+    implementation 'com.pxr:fbolibrary:1.0.0'
+}
+
+task createReleaseArr(type : Copy) {
+    delete 'build/libs'
+    from('build/outputs/aar/')
+    into('build/libs/')
+}
+createReleaseArr.dependsOn(build)

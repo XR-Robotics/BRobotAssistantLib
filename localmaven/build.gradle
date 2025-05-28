@@ -1,0 +1,25 @@
+plugins {
+    id 'maven-publish'
+}
+
+// 定义发布配置
+publishing {
+    publications {
+        capturelib(MavenPublication) {
+            groupId = 'com.pxr'
+            artifactId = 'capturelib'
+            version = '0.0.7'
+            artifact("$projectDir/libs/capturelib-0.0.7.aar")
+        }
+        fbolibrary(MavenPublication) {
+            groupId = 'com.pxr'
+            artifactId = 'fbolibrary'
+            version = '1.0.0'  // 根据实际版本修改
+            artifact("$projectDir/libs/fbolibrary-release.aar")
+        }
+    }
+
+    repositories {
+        mavenLocal()  // 发布到本地Maven仓库 (~/.m2/repository)
+    }
+}
