@@ -60,6 +60,7 @@ dependencies {
 ## Build Commands
 - **Build main library**:
   ```bash
+  ./gradlew :localmaven:publish
   ./gradlew :app:assembleRelease
   ```
 - **Build FBO submodule**:
