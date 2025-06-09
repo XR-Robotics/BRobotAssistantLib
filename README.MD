@@ -14,25 +14,16 @@
 
 ### `app/src/main/java/com/picovr/robotassistantlib`
 Core implementation directory:
-- **FBO Module**
-  - `FBOUtils.java`: OpenGL ES utilities (shader compilation/FBO management)
-  - `FBOPlugin.java`: Bridge between Unity textures and OES textures
-  - `FBOTexture.java`: FBO texture rendering pipeline
 - **Camera Module**
   - `CameraHandle.java`: Camera lifecycle management and encoding control
 - **Media Module**
   - `MediaDecoder.java`: H.264 video decoder implementation
 - **Network Tools**
-  - `ByteBufferUtils.java**: Network packet protocol utilities
-
-### `fbolibrary`
-FBO core implementation module:
-- OpenGL ES 3.0 rendering pipeline
-- Provides binding interfaces between Unity textures and Android SurfaceTexture
+  - `ByteBufferUtils.java`: Network packet protocol utilities
 
 ## Build Artifacts
-- `robotassistant_lib-release.aar`: Main library
-- `fbolibrary-release.aar`: FBO submodule
+- `robotassistant_lib.aar`: Main library
+> Renamed from `robotassistant_lib-i18n-release.aar`
 
 ## Project Configuration
 
@@ -63,17 +54,12 @@ dependencies {
   ./gradlew :localmaven:publish
   ./gradlew :app:assembleRelease
   ```
-- **Build FBO submodule**:
-  ```bash
-  ./gradlew :fbolibrary:assembleRelease
-  ```
 
 ### Output Paths
 ```
 app/build/outputs/aar/
-└── app-release.aar        # Main library
-fbolibrary/build/outputs/aar/
-└── fbolibrary-release.aar # FBO submodule
+└── robotassistant_lib-i18n-release.aar        # Main library
+└── robotassistant_lib-cn-release.aar          # Main library
 ```
 
 ## Versioning
@@ -93,14 +79,6 @@ fbolibrary/build/outputs/aar/
    ```
 
 ## Core API Reference
-### `FBOPlugin` (Unity Interface)
-- `init`: Initialize OpenGL context
-- `getSurface`: Get decoding Surface
-- `BuildTexture`: Bind Unity texture
-- `createFBO`: Create FBO texture
-- `bindFBO`: Bind FBO to Unity
-- `unbindFBO`: Unbind FBO
-- `releaseFBO`: Release FBO resources[README（EN）.MD](../BRobotAssistantU3d/README%EF%BC%88EN%EF%BC%89.MD)
 
 ### `CameraHandle` (Camera Control)
 - `startCamera`: Start camera
