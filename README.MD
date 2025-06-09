@@ -69,7 +69,8 @@ app/build/outputs/aar/
   - `buildcode`: Date + serial number (e.g., 220101001)
 
 ## Integration Guide
-1. Place AAR files in Unity project's `Assets/Plugins/Android` directory
+1. Rename `robotassistant_lib-i18n-release.aar` to `robotassistant_lib.aar`
+2. Place `robotassistant_lib.aar` into Unity project's `Assets/Plugins/Android` directory
 2. Requires Unity 2021.3.15f1 or later
 3. Enable `Multithreaded Rendering` in Player Settings
 4. Required permissions:
