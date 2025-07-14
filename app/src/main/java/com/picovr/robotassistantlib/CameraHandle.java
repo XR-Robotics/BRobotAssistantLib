@@ -45,6 +45,7 @@ public class CameraHandle {
     private MediaMuxer mediaMuxer;
     private int trackIndex;
     private boolean isMuxerStarted = false;
+    private volatile boolean shouldStopEncoding = false; // Flag to signal encoding thread to stop
 
     public int GetCaptureState() {
         return mCaptureState;
@@ -52,24 +53,27 @@ public class CameraHandle {
 
     public int OpenCamera(PXRCameraCallBack call) {
 
-        Log.d(TAG, "OpenCamera");
+        Log.d(TAG, "OpenCamera - current mCaptureState: " + mCaptureState);
 
         if (mCaptureState > PXRCamera.PXRCaptureState.CAPTURE_STATE_IDLE.ordinal()) {
+            Log.w(TAG, "Camera already open, mCaptureState: " + mCaptureState);
             return 0;
         }
 
-        //  mIsPreview = false;
-      //  Map<String, String> cameraParams = new HashMap<>();
-       // cameraParams.put(PXRCamera.CAMERA_PARAMS_KEY_MCTF, PXRCamera.VALUE_TRUE);
-       // cameraParams.put(PXRCamera.CAMERA_PARAMS_KEY_EIS, PXRCamera.VALUE_TRUE);
-       // cameraParams.put(PXRCamera.CAMERA_PARAMS_KEY_MFNR, PXRCamera.VALUE_TRUE);
+        // mIsPreview = false;
+        // Map<String, String> cameraParams = new HashMap<>();
+        // cameraParams.put(PXRCamera.CAMERA_PARAMS_KEY_MCTF, PXRCamera.VALUE_TRUE);
+        // cameraParams.put(PXRCamera.CAMERA_PARAMS_KEY_EIS, PXRCamera.VALUE_TRUE);
+        // cameraParams.put(PXRCamera.CAMERA_PARAMS_KEY_MFNR, PXRCamera.VALUE_TRUE);
         try {
             int openRes = mPXRCamera.openCameraAsync();
             if (openRes != 0) {
-                Log.d(TAG, "openCameraAsync:" + openRes);
+                Log.e(TAG, "openCameraAsync failed with result: " + openRes);
+            } else {
+                Log.d(TAG, "openCameraAsync succeeded");
             }
         } catch (Exception ex) {
-            Log.e(TAG, ex.toString());
+            Log.e(TAG, "Exception in openCameraAsync: " + ex.toString());
         }
 
         return mPXRCamera.setCallback(call);
@@ -78,15 +82,18 @@ public class CameraHandle {
     public static String GetMovieSavePath() {
         return "/sdcard/Download/";
     }
-    private final Object mediaEncodeLock = new Object();  // 线程锁
+
+    private final Object mediaEncodeLock = new Object(); // 线程锁
+
     public int StartPreview(int width, int height, int mode) {
         previewWidth = width;
         previewHeight = height;
 
         renderMode = mode;
-        Log.i(TAG, "StartPreview " + " width:" + width + " height:" + height );
+        Log.i(TAG, "StartPreview " + " width:" + width + " height:" + height);
 
         useState = UseState.Preview;
+        shouldStopEncoding = false; // Reset the stop flag
 
         try {
 
@@ -102,7 +109,8 @@ public class CameraHandle {
             mediaEncode.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             Log.i(TAG, "StartPreview  setConfigure");
             surface = mediaEncode.createInputSurface();
-            MediaCodecInfo.CodecCapabilities capabilities = mediaEncode.getCodecInfo().getCapabilitiesForType("video/avc");
+            MediaCodecInfo.CodecCapabilities capabilities = mediaEncode.getCodecInfo()
+                    .getCapabilitiesForType("video/avc");
             for (int colorFormat : capabilities.colorFormats) {
                 Log.i(TAG, "Supported color format: " + colorFormat);
             }
@@ -112,14 +120,20 @@ public class CameraHandle {
             Log.i(TAG, "startPreview");
             mPXRCamera.startPreview(surface, renderMode, previewWidth, previewHeight);
 
-
         } catch (IOException | RuntimeException e) {
             e.printStackTrace();
             cleanup();
         }
 
-
         return 0;
+    }
+
+    public int startSendingImages(String ip, int port) {
+        if (useState != UseState.Preview) {
+            Log.e(TAG, "Cannot start sending images - preview not started");
+            return -1;
+        }
+        return StartSendImage(ip, port);
     }
 
     private int StartSendImage(String ip, int port) {
@@ -139,8 +153,19 @@ public class CameraHandle {
                 } catch (IOException e) {
                     Log.e(TAG, "Socket connection failed", e);
 
-                    mPXRCamera.stopPreview();
-                    mediaEncode.stop();
+                    // Properly handle cleanup on failure
+                    useState = UseState.IDLE;
+                    shouldStopEncoding = true;
+                    try {
+                        mPXRCamera.stopPreview();
+                        synchronized (mediaEncodeLock) {
+                            if (mediaEncode != null) {
+                                mediaEncode.stop();
+                            }
+                        }
+                    } catch (Exception cleanupException) {
+                        Log.e(TAG, "Error during cleanup after socket failure", cleanupException);
+                    }
                     cleanup();
                 }
             }
@@ -166,26 +191,41 @@ public class CameraHandle {
         return 0;
     }
 
-
     public void EncodeStreaming(boolean tcpSend) {
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
 
-        Log.i(TAG, "tartStreaming tcpSend:" + tcpSend + " useState:" + useState);
-        while (useState == UseState.Preview) {
+        Log.i(TAG, "startStreaming tcpSend:" + tcpSend + " useState:" + useState);
+        while (useState == UseState.Preview && !Thread.currentThread().isInterrupted() && !shouldStopEncoding) {
             try {
                 long startTime = System.currentTimeMillis(); // Record the start time of the loop
                 Log.i(TAG, "  startTime " + startTime);
                 int outputBufferIndex;
                 synchronized (mediaEncodeLock) {
-                    if (mediaEncode == null) break; // 避免 NullPointerException
-                    outputBufferIndex = mediaEncode.dequeueOutputBuffer(info, 10000);
+                    if (mediaEncode == null || useState != UseState.Preview) {
+                        Log.i(TAG, "MediaCodec is null or state changed, breaking encode loop");
+                        break; // 避免 NullPointerException 和状态不一致
+                    }
+                    try {
+                        outputBufferIndex = mediaEncode.dequeueOutputBuffer(info, 10000);
+                    } catch (IllegalStateException e) {
+                        Log.e(TAG, "MediaCodec dequeueOutputBuffer failed - codec may be stopped", e);
+                        break; // Exit the loop if MediaCodec is in invalid state
+                    }
                 }
                 if (outputBufferIndex >= 0) {
                     ByteBuffer encodedData;
                     // Obtain encoded data
                     synchronized (mediaEncodeLock) {
-                        if (mediaEncode == null) break;
-                         encodedData = mediaEncode.getOutputBuffer(outputBufferIndex);
+                        if (mediaEncode == null || useState != UseState.Preview) {
+                            Log.i(TAG, "MediaCodec is null or state changed during buffer processing");
+                            break;
+                        }
+                        try {
+                            encodedData = mediaEncode.getOutputBuffer(outputBufferIndex);
+                        } catch (IllegalStateException e) {
+                            Log.e(TAG, "MediaCodec getOutputBuffer failed - codec may be stopped", e);
+                            break;
+                        }
                     }
                     if (tcpSend) {
                         int bodyLength = encodedData.remaining();
@@ -212,32 +252,47 @@ public class CameraHandle {
                         }
                     } else {
                         if (encodedData != null && isMuxerStarted) {
-                           // Log.i(TAG, "info.presentationTimeUs:" +  info.presentationTimeUs);
-                            encodedData = addSEI(encodedData,  info.presentationTimeUs);//微秒
+                            // Log.i(TAG, "info.presentationTimeUs:" + info.presentationTimeUs);
+                            encodedData = addSEI(encodedData, info.presentationTimeUs);// 微秒
                             mediaMuxer.writeSampleData(trackIndex, encodedData, info);
                         }
                     }
                     synchronized (mediaEncodeLock) {
-                        if (mediaEncode == null) break;
-                        mediaEncode.releaseOutputBuffer(outputBufferIndex, false);
+                        if (mediaEncode == null || useState != UseState.Preview) {
+                            Log.i(TAG, "MediaCodec is null or state changed during buffer release");
+                            break;
+                        }
+                        try {
+                            mediaEncode.releaseOutputBuffer(outputBufferIndex, false);
+                        } catch (IllegalStateException e) {
+                            Log.e(TAG, "MediaCodec releaseOutputBuffer failed - codec may be stopped", e);
+                            break;
+                        }
                     }
                 } else if (outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
                     // There is no output buffer, you may need to try again later
                     continue;
                 } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     // Output format changes (such as when the encoder is reinitialized)
-                    if(!tcpSend)
-                    {
+                    if (!tcpSend) {
                         synchronized (mediaEncodeLock) {
-                            if (mediaEncode == null) break;
-                            MediaFormat newFormat = mediaEncode.getOutputFormat();
-                            ByteBuffer bf1 = newFormat.getByteBuffer("csd-1");
-                            ByteBuffer bf2 = newFormat.getByteBuffer("csd-0");
-                            Log.i(TAG, "The output format has been changed:" + newFormat);
+                            if (mediaEncode == null || useState != UseState.Preview) {
+                                Log.i(TAG, "MediaCodec is null or state changed during format change");
+                                break;
+                            }
+                            try {
+                                MediaFormat newFormat = mediaEncode.getOutputFormat();
+                                ByteBuffer bf1 = newFormat.getByteBuffer("csd-1");
+                                ByteBuffer bf2 = newFormat.getByteBuffer("csd-0");
+                                Log.i(TAG, "The output format has been changed:" + newFormat);
 
-                            trackIndex = mediaMuxer.addTrack(mediaEncode.getOutputFormat());
-                            mediaMuxer.start();
-                            isMuxerStarted = true;
+                                trackIndex = mediaMuxer.addTrack(mediaEncode.getOutputFormat());
+                                mediaMuxer.start();
+                                isMuxerStarted = true;
+                            } catch (IllegalStateException e) {
+                                Log.e(TAG, "MediaCodec getOutputFormat failed - codec may be stopped", e);
+                                break;
+                            }
                         }
                     }
                 }
@@ -247,12 +302,14 @@ public class CameraHandle {
                 reconnectSocket(); // Attempt to reconnect when an exception occurs
             }
         }
+        Log.i(TAG, "EncodeStreaming loop ended - useState: " + useState + ", shouldStopEncoding: " + shouldStopEncoding
+                + ", interrupted: " + Thread.currentThread().isInterrupted());
     }
 
-    //在每帧中插入时间戳，此时间戳与操作录制文件中“predictTime”字段对应.
+    // 在每帧中插入时间戳，此时间戳与操作录制文件中“predictTime”字段对应.
     private ByteBuffer addSEI(ByteBuffer encodedData, long timestamp) {
-        byte[] seiHeader = new byte[]{0x00, 0x00, 0x00, 0x01, 0x06}; // SEI NALU 头部
-        byte seiPayloadType = 0x05;  // SEI 类型 5（User Data Unregistered）
+        byte[] seiHeader = new byte[] { 0x00, 0x00, 0x00, 0x01, 0x06 }; // SEI NALU 头部
+        byte seiPayloadType = 0x05; // SEI 类型 5（User Data Unregistered）
 
         // 时间戳转换为字节数组
         byte[] timestampBytes = ByteBuffer.allocate(8).putLong(timestamp).array();
@@ -266,7 +323,7 @@ public class CameraHandle {
         seiBuffer.put(seiPayloadType); // SEI 类型
         seiBuffer.put(seiPayloadSize); // SEI 负载长度
         seiBuffer.put(timestampBytes); // 时间戳数据
-        seiBuffer.put((byte) 0x80);    // RBSP Stop Bit，防止截断
+        seiBuffer.put((byte) 0x80); // RBSP Stop Bit，防止截断
 
         // 组合 SEI 数据和原始数据
         ByteBuffer outputBuffer = ByteBuffer.allocate(seiBuffer.remaining() + encodedData.remaining());
@@ -278,19 +335,46 @@ public class CameraHandle {
     }
 
     public int StopPreview() {
+        Log.i(TAG, "StopPreview starting...");
+
+        // First, set flags to signal encoding thread to stop
         useState = UseState.IDLE;
-        Log.i("StopPreview:", "StopPreview:1");
+        shouldStopEncoding = true;
+
+        // Stop camera preview first
         int res = mPXRCamera.stopPreview();
-        Log.i("StopPreview:", "StopPreview:2");
+        Log.i(TAG, "Camera preview stopped");
+
+        // Wait for encode thread to finish before stopping MediaCodec
+        if (encodeThread != null && encodeThread.isAlive()) {
+            Log.i(TAG, "Waiting for encode thread to finish...");
+            try {
+                encodeThread.join(5000); // Wait up to 5 seconds
+                Log.i(TAG, "Encode thread finished");
+            } catch (InterruptedException e) {
+                Log.e(TAG, "Interrupted while waiting for encode thread", e);
+                // Interrupt the thread if it's still running
+                encodeThread.interrupt();
+            }
+            encodeThread = null;
+        }
+
+        // Now safely stop MediaCodec
         synchronized (mediaEncodeLock) {
             if (mediaEncode != null) {
-                mediaEncode.signalEndOfInputStream();
-                EncodeStreaming(targetPort > 0);
-                mediaEncode.stop();
+                try {
+                    Log.i(TAG, "Stopping MediaCodec...");
+                    mediaEncode.stop();
+                    Log.i(TAG, "MediaCodec stopped successfully");
+                } catch (IllegalStateException e) {
+                    Log.e(TAG, "MediaCodec stop failed", e);
+                }
                 mediaEncode.release();
                 mediaEncode = null;
+                Log.i(TAG, "MediaCodec released");
             }
         }
+
         if (mediaMuxer != null) {
             try {
                 if (isMuxerStarted) {
@@ -303,27 +387,50 @@ public class CameraHandle {
             mediaMuxer = null;
         }
 
+        // Clean up surface
+        if (surface != null) {
+            surface.release();
+            surface = null;
+        }
+
+        // Clean up socket connection
+        cleanupSocket();
+
+        // Reset state variables
+        isMuxerStarted = false;
+        trackIndex = -1;
+        shouldStopEncoding = false; // Reset for next streaming session
+
+        // Reset capture state to allow reopening camera
+        mCaptureState = PXRCamera.PXRCaptureState.CAPTURE_STATE_IDLE.ordinal();
+
+        Log.i(TAG, "StopPreview completed, mCaptureState reset to: " + mCaptureState);
+
         return res;
     }
 
     public void SetConfig(int enableMvHevc, int videoFps) {
         mEnableMvHevc = enableMvHevc;
         mVideoFps = videoFps;
-     //   mBitrate = bitrate;
+        // mBitrate = bitrate;
 
-        Log.i(TAG, "SetConfig: " + mEnableMvHevc + " " + mVideoFps +  " " + mBitrate);
+        Log.i(TAG, "SetConfig: " + mEnableMvHevc + " " + mVideoFps + " " + mBitrate);
         Log.i(TAG, "SetConfig mCaptureState: " + mCaptureState);
 
-     //   Map<String, String> configureParams = new HashMap<>();
-       // configureParams.put(PXRCapture.CONFIGURE_PARAMS_KEY_ENABLE_MVHEVC, String.valueOf(enableMvHevc));// 0
-       // configureParams.put(PXRCapture.CONFIGURE_PARAMS_KEY_VIDEO_FPS, String.valueOf(videoFps));//60
-       // configureParams.put(PXRCapture.CONFIGURE_PARAMS_KEY_VIDEO_WIDTH, String.valueOf(videoWidth));//2048
-       // configureParams.put(PXRCapture.CONFIGURE_PARAMS_KEY_VIDEO_HEIGHT, String.valueOf(videoHeight));//1536 / 2
-       // configureParams.put(PXRCapture.CONFIGURE_PARAMS_KEY_VIDEO_BITRATE, String.valueOf(bitrate));//10 * 1024 * 1024  默认40M
+        // Map<String, String> configureParams = new HashMap<>();
+        // configureParams.put(PXRCapture.CONFIGURE_PARAMS_KEY_ENABLE_MVHEVC,
+        // String.valueOf(enableMvHevc));// 0
+        // configureParams.put(PXRCapture.CONFIGURE_PARAMS_KEY_VIDEO_FPS,
+        // String.valueOf(videoFps));//60
+        // configureParams.put(PXRCapture.CONFIGURE_PARAMS_KEY_VIDEO_WIDTH,
+        // String.valueOf(videoWidth));//2048
+        // configureParams.put(PXRCapture.CONFIGURE_PARAMS_KEY_VIDEO_HEIGHT,
+        // String.valueOf(videoHeight));//1536 / 2
+        // configureParams.put(PXRCapture.CONFIGURE_PARAMS_KEY_VIDEO_BITRATE,
+        // String.valueOf(bitrate));//10 * 1024 * 1024 默认40M
         mPXRCamera.enableEIS(true);
-        mPXRCamera.configure(enableMvHevc==1,videoFps);
+        mPXRCamera.configure(enableMvHevc == 1, videoFps);
     }
-
 
     public String getCameraExtrinsics() {
         double[] leftCameraExtrinsics = new double[16];
@@ -336,18 +443,19 @@ public class CameraHandle {
         return Arrays.toString(leftCameraExtrinsics) + "|" + Arrays.toString(rightCameraExtrinsics);
     }
 
-
     public String getCameraIntrinsics(int width, int height) {
         double[] cameraIntrinsics = new double[4];
         int[] len = new int[1];
         /**
-         *Output Width: The width of the video that the business needs to output
-         *Output Height: The height of the video that the business needs to output
-         *OutputFovHorizontal: The horizontal FOV of the video that the business needs to output Default 76.35f
-         *OutputFovVertical: The vertical FOV of the video that the business needs to output Default 61.05f
-         *Camera Intrinsics: Distortion Parameters
-         *Len: Distortion parameter length
-         *Return: Whether the execution was successful. 1 success 0 failure
+         * Output Width: The width of the video that the business needs to output
+         * Output Height: The height of the video that the business needs to output
+         * OutputFovHorizontal: The horizontal FOV of the video that the business needs
+         * to output Default 76.35f
+         * OutputFovVertical: The vertical FOV of the video that the business needs to
+         * output Default 61.05f
+         * Camera Intrinsics: Distortion Parameters
+         * Len: Distortion parameter length
+         * Return: Whether the execution was successful. 1 success 0 failure
          */
         mPXRCamera.getCameraIntrinsics(width,
                 height,
@@ -356,24 +464,50 @@ public class CameraHandle {
                 cameraIntrinsics,
                 len);
 
-        //   Log.i(tag, "cameraIntrinsics len: " + len[0] + " value: " + Arrays.toString(cameraIntrinsics));
+        // Log.i(tag, "cameraIntrinsics len: " + len[0] + " value: " +
+        // Arrays.toString(cameraIntrinsics));
         return Arrays.toString(cameraIntrinsics);
     }
 
     public static String formatRecordTimeString(long startTime, long stopTime, String timezone, String formatStr) {
-        long time = (stopTime == 0 ? System.currentTimeMillis() : stopTime) - startTime;//long now = android.os.SystemClock.uptimeMillis();
+        long time = (stopTime == 0 ? System.currentTimeMillis() : stopTime) - startTime;// long now =
+                                                                                        // android.os.SystemClock.uptimeMillis();
         SimpleDateFormat format = new SimpleDateFormat(formatStr);
         format.setTimeZone(timezone == null ? TimeZone.getDefault() : TimeZone.getTimeZone(timezone));
         Date d1 = new Date(time);
         String t1 = format.format(d1);
         return t1;
     }
-    public int CloseCamera() {
 
+    /**
+     * Reset all state variables to initial state for multiple streaming sessions
+     */
+    private void resetState() {
         useState = UseState.IDLE;
-        Log.i(TAG, "CloseCamera");
-        mPXRCamera.reset();
+        shouldStopEncoding = false;
         mCaptureState = PXRCamera.PXRCaptureState.CAPTURE_STATE_IDLE.ordinal();
+        encodeThread = null;
+        mediaEncode = null;
+        socket = null;
+        outputStream = null;
+        surface = null;
+        mediaMuxer = null;
+        trackIndex = -1;
+        isMuxerStarted = false;
+        targetPort = 0; // Reset to indicate no active connection
+        Log.i(TAG, "State reset completed");
+    }
+
+    public int CloseCamera() {
+        Log.i(TAG, "CloseCamera");
+
+        // Stop any ongoing preview first
+        if (useState == UseState.Preview) {
+            StopPreview();
+        }
+
+        mPXRCamera.reset();
+        resetState();
         cleanup();
 
         return mPXRCamera.closeCamera();
@@ -389,20 +523,45 @@ public class CameraHandle {
         }
         // Try reconnecting the Socket
         try {
-
             synchronized (mediaEncodeLock) {
+                // Clean up existing connection
+                if (outputStream != null) {
+                    try {
+                        outputStream.close();
+                    } catch (IOException e) {
+                        Log.e(TAG, "Error closing output stream", e);
+                    }
+                    outputStream = null;
+                }
+
                 if (socket != null && !socket.isClosed()) {
                     socket.close();
                 }
-                socket = new Socket(targetIp, targetPort);
+
+                // Create new connection
+                socket = new Socket();
+                socket.connect(new InetSocketAddress(targetIp, targetPort), 5000);
                 outputStream = socket.getOutputStream();
-                Log.i(TAG, "Socket connected!");
+                Log.i(TAG, "Socket reconnected successfully!");
             }
-
-
         } catch (IOException e) {
-            e.printStackTrace();
-            Log.i(TAG, "Reconnect failed, please check your network connection.");
+            Log.e(TAG, "Reconnect failed, please check your network connection", e);
+        }
+    }
+
+    private void cleanupSocket() {
+        try {
+            if (outputStream != null) {
+                outputStream.close();
+                outputStream = null;
+            }
+            if (socket != null && !socket.isClosed()) {
+                socket.close();
+                socket = null;
+            }
+            Log.i(TAG, "Socket cleanup completed");
+        } catch (IOException e) {
+            Log.e(TAG, "Error during socket cleanup", e);
         }
     }
 
@@ -410,17 +569,25 @@ public class CameraHandle {
         try {
             synchronized (mediaEncodeLock) {
                 if (mediaEncode != null) {
-                    mediaEncode.stop();
+                    try {
+                        mediaEncode.stop();
+                    } catch (IllegalStateException e) {
+                        Log.e(TAG, "MediaCodec stop failed during cleanup", e);
+                    }
                     mediaEncode.release();
                     mediaEncode = null;
                 }
-
-                if (socket != null && !socket.isClosed()) {
-                    socket.close();
-                }
             }
-        } catch (IOException e) {
-            e.printStackTrace();
+
+            cleanupSocket();
+
+            if (surface != null) {
+                surface.release();
+                surface = null;
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error during cleanup", e);
         }
     }
 }
