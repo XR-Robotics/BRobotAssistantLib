@@ -29,7 +29,7 @@ import com.picoxr.fbolibrary.FBOPlugin;
 public class MediaDecoder {
     private final String TAG = "MediaDecoder";
     private MediaCodec mediaCodec;
-    private String mimeType = "video/avc"; //H. 264 format
+    private String mimeType = "video/avc"; // H. 264 format
     private int previewTextureId;
     private FBOPlugin mFBOPlugin = null;
     private Thread tcpThread;
@@ -40,92 +40,122 @@ public class MediaDecoder {
     private long lastTimestamp = 0;
 
     public void initialize(int unityTextureId, int width, int height) throws Exception {
+        Log.i(TAG, "initialize: textureId=" + unityTextureId + ", size=" + width + "x" + height);
 
+        // Clean up any existing resources first
         if (mediaCodec != null) {
             release();
         }
+
         this.width = width;
         this.height = height;
+        this.previewTextureId = unityTextureId;
+
+        // Initialize FBOPlugin
         if (mFBOPlugin == null) {
             mFBOPlugin = new FBOPlugin();
         }
         mFBOPlugin.init();
         mFBOPlugin.BuildTexture(unityTextureId, width, height);
-        previewTextureId = unityTextureId;
-        Log.i(TAG, "initialize:" + unityTextureId);
+
+        // Create and configure MediaCodec
         MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
-        //format.setInteger(MediaFormat.KEY_FRAME_RATE, 60);
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
 
         // Enable low latency mode
-        format.setInteger(MediaFormat.KEY_PRIORITY, 0);  // Real-time priority
-        format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);  // Enable low latency mode
+        format.setInteger(MediaFormat.KEY_PRIORITY, 0); // Real-time priority
+        format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1); // Enable low latency mode
 
         mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
         mediaCodec.configure(format, mFBOPlugin.getSurface(), null, 0);
-
-        // // Request hardware acceleration
-        //mediaCodec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT);
-
         mediaCodec.start();
-        Log.i(TAG, "mediaCodec start() with low latency mode enabled");
+
+        // Reset state variables
+        lastTimestamp = 0;
+        savePng = false;
+
+        Log.i(TAG, "MediaDecoder initialized successfully with low latency mode enabled");
     }
 
     private byte[] buffer;
 
-    private void startTCPServer(int port, boolean record) throws IOException {
+    public void startTCPServer(int port, boolean record) throws IOException {
+        // Stop existing TCP server if running
+        stopTCPServer();
+
         receivie = true;
         Log.i(TAG, "startTCPServer:" + port);
         if (buffer == null) {
-            buffer = new byte[1024 * 1024];  // Adjust the buffer size according to the actual situation
+            buffer = new byte[1024 * 1024]; // Adjust the buffer size according to the actual situation
         }
         tcpThread = new Thread(new Runnable() {
             @Override
             public void run() {
+                ServerSocket serverSocket = null;
+                Socket socket = null;
+                InputStream inputStream = null;
+                DataInputStream dataInputStream = null;
+
                 try {
-
                     Log.i(TAG, "-ServerSocket:" + port);
-                    ServerSocket serverSocket = new ServerSocket(port);
-                    Socket socket = serverSocket.accept();
+                    serverSocket = new ServerSocket(port);
+                    socket = serverSocket.accept();
                     Log.i(TAG, "Socket connected:" + port);
-                    InputStream inputStream = socket.getInputStream();
-                    DataInputStream dataInputStream = new DataInputStream(inputStream);
-                    while (receivie) {
+                    inputStream = socket.getInputStream();
+                    dataInputStream = new DataInputStream(inputStream);
 
-                        // Read the 4-byte header and obtain the length of the packet body
-                        byte[] header = new byte[4];
-                        dataInputStream.readFully(header);
+                    while (receivie && !Thread.currentThread().isInterrupted()) {
+                        try {
+                            // Read the 4-byte header and obtain the length of the packet body
+                            byte[] header = new byte[4];
+                            dataInputStream.readFully(header);
 
-                        // Analyze package length (big end mode)
-                        ByteBuffer buffer = ByteBuffer.wrap(header);
-                        buffer.order(ByteOrder.BIG_ENDIAN);
-                        int bodyLength = buffer.getInt();
-                        Log.i(TAG, "Received packet length: " + bodyLength);
+                            // Analyze package length (big end mode)
+                            ByteBuffer buffer = ByteBuffer.wrap(header);
+                            buffer.order(ByteOrder.BIG_ENDIAN);
+                            int bodyLength = buffer.getInt();
+                            Log.i(TAG, "Received packet length: " + bodyLength);
 
-                        byte[] body = new byte[bodyLength];
-                        dataInputStream.readFully(body); // Ensure complete reading
+                            byte[] body = new byte[bodyLength];
+                            dataInputStream.readFully(body); // Ensure complete reading
 
-                        if (!receivie) {
+                            if (!receivie || Thread.currentThread().isInterrupted()) {
+                                break;
+                            }
+
+                            Log.i(TAG, "inputStream.read: " + bodyLength);
+                            if (bodyLength > 0) {
+                                if (record) {
+                                    Record(body, bodyLength);
+                                }
+                                decode(body, bodyLength);
+                            }
+                        } catch (IOException e) {
+                            if (receivie && !Thread.currentThread().isInterrupted()) {
+                                Log.e(TAG, "Error reading from socket", e);
+                            }
                             break;
                         }
-
-                        Log.i(TAG, "inputStream.read: " + bodyLength);
-                        if (bodyLength > 0) {
-
-                            if (record) {
-                                Record(body, bodyLength);
-                            }
-                            decode(body, bodyLength);
-                        }
                     }
-
-                    inputStream.close();
-                    socket.close();
-                    serverSocket.close();
-
-                    Log.i(TAG, "socket close");
                 } catch (Exception e) {
-                    e.printStackTrace();
+                    if (receivie && !Thread.currentThread().isInterrupted()) {
+                        Log.e(TAG, "TCP server error", e);
+                    }
+                } finally {
+                    // Clean up resources
+                    try {
+                        if (dataInputStream != null)
+                            dataInputStream.close();
+                        if (inputStream != null)
+                            inputStream.close();
+                        if (socket != null)
+                            socket.close();
+                        if (serverSocket != null)
+                            serverSocket.close();
+                    } catch (IOException e) {
+                        Log.e(TAG, "Error closing TCP resources", e);
+                    }
+                    Log.i(TAG, "TCP thread finished");
                 }
             }
         });
@@ -169,17 +199,17 @@ public class MediaDecoder {
 
     private long computePresentationTime(long frameIndex) {
 
-        //return 132 + frameIndex * 1000000 / 30;
+        // return 132 + frameIndex * 1000000 / 30;
         long currentTime = System.nanoTime() / 1000; // Convert to microseconds
         lastTimestamp = Math.max(lastTimestamp + 1, currentTime);
         return lastTimestamp;
 
     }
 
-
     private void decode(byte[] data, int length) throws Exception {
 
-        //   Log.i(TAG, "decode length:" + length + " isComplete:" + isComplete + " isKeyFrame:" + isKeyFrame + " nalu:" + nalu);
+        // Log.i(TAG, "decode length:" + length + " isComplete:" + isComplete + "
+        // isKeyFrame:" + isKeyFrame + " nalu:" + nalu);
         int inputBufferIndex = mediaCodec.dequeueInputBuffer(0);
         if (inputBufferIndex >= 0) {
             ByteBuffer inputBuffer = mediaCodec.getInputBuffer(inputBufferIndex);
@@ -216,7 +246,6 @@ public class MediaDecoder {
                 // Release output buffer
                 mediaCodec.releaseOutputBuffer(outputBufferIndex, true);
                 outputBufferIndex = mediaCodec.dequeueOutputBuffer(bufferInfo, 1000);
-
 
             } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                 MediaFormat newFormat = mediaCodec.getOutputFormat();
@@ -260,17 +289,41 @@ public class MediaDecoder {
     }
 
     public void release() throws IOException {
-
         Log.i(TAG, "mediaCodec release");
-        receivie = false;
+
+        // Stop TCP server first
+        stopTCPServer();
+
+        // Stop and release MediaCodec
         if (mediaCodec != null) {
-            mediaCodec.stop();
-            mediaCodec.release();
+            try {
+                mediaCodec.stop();
+                mediaCodec.release();
+            } catch (Exception e) {
+                Log.e(TAG, "Error releasing MediaCodec", e);
+            }
             mediaCodec = null;
         }
 
-        if (fileOutputStream != null) fileOutputStream.close();
-        fileOutputStream = null;
+        // Clean up FBOPlugin
+        if (mFBOPlugin != null) {
+            try {
+                mFBOPlugin.release(); // Assume FBOPlugin has a release method
+            } catch (Exception e) {
+                Log.w(TAG, "Error releasing FBOPlugin (method may not exist)", e);
+            }
+            mFBOPlugin = null;
+        }
+
+        // Reset state variables
+        lastTimestamp = 0;
+        savePng = false;
+        previewTextureId = 0;
+        width = 0;
+        height = 0;
+        buffer = null;
+
+        Log.i(TAG, "MediaDecoder fully released and reset");
     }
 
     boolean savePng = false;
@@ -278,5 +331,33 @@ public class MediaDecoder {
     public void SavePng() {
         savePng = true;
     }
-}
 
+    /**
+     * Stop the TCP server and clean up resources
+     */
+    public void stopTCPServer() {
+        Log.i(TAG, "stopTCPServer");
+        receivie = false;
+
+        if (tcpThread != null && tcpThread.isAlive()) {
+            try {
+                tcpThread.interrupt();
+                tcpThread.join(1000); // Wait up to 1 second for thread to finish
+            } catch (InterruptedException e) {
+                Log.w(TAG, "Interrupted while waiting for TCP thread to stop", e);
+                Thread.currentThread().interrupt(); // Restore interrupt status
+            }
+            tcpThread = null;
+        }
+
+        // Close file output stream if open
+        if (fileOutputStream != null) {
+            try {
+                fileOutputStream.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Error closing fileOutputStream", e);
+            }
+            fileOutputStream = null;
+        }
+    }
+}

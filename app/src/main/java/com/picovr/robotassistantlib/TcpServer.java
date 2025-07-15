@@ -73,9 +73,10 @@ public class TcpServer {
                         try {
                             dataInputStream.readFully(header);
                         } catch (IOException e) {
-                            Log.e(TAG, "Failed to read header, client might have disconnected.", e);
+//                            Log.e(TAG, "Failed to read header, client might have disconnected.", e);
                             if (serverCallback != null) {
-                                serverCallback.onError("Failed to read header", e);
+                                // This might cause JNI ERROR (app bug): global reference table overflow.
+//                                serverCallback.onError("Failed to read header", e);
                             }
                             continue; // skip loop if cannot read header
                         }

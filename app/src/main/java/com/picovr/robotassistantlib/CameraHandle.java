@@ -197,8 +197,6 @@ public class CameraHandle {
         Log.i(TAG, "startStreaming tcpSend:" + tcpSend + " useState:" + useState);
         while (useState == UseState.Preview && !Thread.currentThread().isInterrupted() && !shouldStopEncoding) {
             try {
-                long startTime = System.currentTimeMillis(); // Record the start time of the loop
-                Log.i(TAG, "  startTime " + startTime);
                 int outputBufferIndex;
                 synchronized (mediaEncodeLock) {
                     if (mediaEncode == null || useState != UseState.Preview) {
@@ -242,8 +240,6 @@ public class CameraHandle {
                         byte[] packet = buffer.array();
                         // Check if the Socket is connected properly
                         if (socket != null && socket.isConnected()) {
-
-                            Log.i(TAG, "  outputStream.write " + length);
                             outputStream.write(packet);
                             outputStream.flush();
                         } else {
@@ -347,14 +343,16 @@ public class CameraHandle {
 
         // Wait for encode thread to finish before stopping MediaCodec
         if (encodeThread != null && encodeThread.isAlive()) {
-            Log.i(TAG, "Waiting for encode thread to finish...");
+            encodeThread.interrupt(); // Interrupt the thread if it's blocking on I/O
             try {
-                encodeThread.join(5000); // Wait up to 5 seconds
-                Log.i(TAG, "Encode thread finished");
+                encodeThread.join(3000); // Wait for the thread to die for up to 3 seconds
+                if (encodeThread.isAlive()) {
+                    Log.w(TAG, "Encode thread did not terminate in time. Forcing shutdown...");
+                } else {
+                    Log.i(TAG, "Encode thread stopped successfully.");
+                }
             } catch (InterruptedException e) {
-                Log.e(TAG, "Interrupted while waiting for encode thread", e);
-                // Interrupt the thread if it's still running
-                encodeThread.interrupt();
+                Log.e(TAG, "Interrupted while waiting for encode thread to stop.", e);
             }
             encodeThread = null;
         }
@@ -401,10 +399,19 @@ public class CameraHandle {
         trackIndex = -1;
         shouldStopEncoding = false; // Reset for next streaming session
 
-        // Reset capture state to allow reopening camera
-        mCaptureState = PXRCamera.PXRCaptureState.CAPTURE_STATE_IDLE.ordinal();
+        // IMPORTANT: Reset camera completely to allow reopening
+        try {
+            Log.i(TAG, "Resetting camera to ensure clean state...");
+            mPXRCamera.reset();
+            // Don't set mCaptureState manually - let the camera reset it properly
+            Log.i(TAG, "Camera reset completed");
+        } catch (Exception e) {
+            Log.e(TAG, "Error during camera reset", e);
+            // Force reset the state if camera reset fails
+            mCaptureState = PXRCamera.PXRCaptureState.CAPTURE_STATE_IDLE.ordinal();
+        }
 
-        Log.i(TAG, "StopPreview completed, mCaptureState reset to: " + mCaptureState);
+        Log.i(TAG, "StopPreview completed, camera state should be reset");
 
         return res;
     }
@@ -469,16 +476,6 @@ public class CameraHandle {
         return Arrays.toString(cameraIntrinsics);
     }
 
-    public static String formatRecordTimeString(long startTime, long stopTime, String timezone, String formatStr) {
-        long time = (stopTime == 0 ? System.currentTimeMillis() : stopTime) - startTime;// long now =
-                                                                                        // android.os.SystemClock.uptimeMillis();
-        SimpleDateFormat format = new SimpleDateFormat(formatStr);
-        format.setTimeZone(timezone == null ? TimeZone.getDefault() : TimeZone.getTimeZone(timezone));
-        Date d1 = new Date(time);
-        String t1 = format.format(d1);
-        return t1;
-    }
-
     /**
      * Reset all state variables to initial state for multiple streaming sessions
      */
@@ -499,18 +496,33 @@ public class CameraHandle {
     }
 
     public int CloseCamera() {
-        Log.i(TAG, "CloseCamera");
+        Log.i(TAG, "CloseCamera starting...");
 
         // Stop any ongoing preview first
         if (useState == UseState.Preview) {
             StopPreview();
         }
 
-        mPXRCamera.reset();
+        int result = 0;
+        try {
+            // Close the camera properly
+            result = mPXRCamera.closeCamera();
+            Log.i(TAG, "Camera closed with result: " + result);
+
+            // Reset camera to ensure clean state
+            mPXRCamera.reset();
+            Log.i(TAG, "Camera reset completed");
+        } catch (Exception e) {
+            Log.e(TAG, "Error during camera close/reset", e);
+            result = -1;
+        }
+
+        // Clean up all resources
         resetState();
         cleanup();
 
-        return mPXRCamera.closeCamera();
+        Log.i(TAG, "CloseCamera completed");
+        return result;
     }
 
     public enum UseState {
