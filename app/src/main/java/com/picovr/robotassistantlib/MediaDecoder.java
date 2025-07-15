@@ -44,7 +44,14 @@ public class MediaDecoder {
 
         // Clean up any existing resources first
         if (mediaCodec != null) {
+            Log.i(TAG, "Cleaning up existing MediaCodec before reinitializing");
             release();
+            // Add a small delay to ensure proper cleanup
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
 
         this.width = width;
@@ -58,17 +65,37 @@ public class MediaDecoder {
         mFBOPlugin.init();
         mFBOPlugin.BuildTexture(unityTextureId, width, height);
 
-        // Create and configure MediaCodec
-        MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
-        format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
+        // Create and configure MediaCodec with proper error handling
+        try {
+            MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
+            format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
 
-        // Enable low latency mode
-        format.setInteger(MediaFormat.KEY_PRIORITY, 0); // Real-time priority
-        format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1); // Enable low latency mode
+            // Enable low latency mode
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0); // Real-time priority
+            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1); // Enable low latency mode
 
-        mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-        mediaCodec.configure(format, mFBOPlugin.getSurface(), null, 0);
-        mediaCodec.start();
+            mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
+            if (mediaCodec == null) {
+                throw new Exception("Failed to create MediaCodec decoder");
+            }
+
+            mediaCodec.configure(format, mFBOPlugin.getSurface(), null, 0);
+            mediaCodec.start();
+
+            Log.i(TAG, "MediaCodec created and started successfully");
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to initialize MediaCodec", e);
+            if (mediaCodec != null) {
+                try {
+                    mediaCodec.release();
+                } catch (Exception releaseEx) {
+                    Log.e(TAG, "Error releasing failed MediaCodec", releaseEx);
+                }
+                mediaCodec = null;
+            }
+            throw e;
+        }
 
         // Reset state variables
         lastTimestamp = 0;
@@ -114,7 +141,7 @@ public class MediaDecoder {
                             ByteBuffer buffer = ByteBuffer.wrap(header);
                             buffer.order(ByteOrder.BIG_ENDIAN);
                             int bodyLength = buffer.getInt();
-                            Log.i(TAG, "Received packet length: " + bodyLength);
+//                            Log.i(TAG, "Received packet length: " + bodyLength);
 
                             byte[] body = new byte[bodyLength];
                             dataInputStream.readFully(body); // Ensure complete reading
@@ -123,12 +150,16 @@ public class MediaDecoder {
                                 break;
                             }
 
-                            Log.i(TAG, "inputStream.read: " + bodyLength);
+//                            Log.i(TAG, "inputStream.read: " + bodyLength);
                             if (bodyLength > 0) {
                                 if (record) {
                                     Record(body, bodyLength);
                                 }
-                                decode(body, bodyLength);
+                                if (isMediaCodecReady()) {
+                                    decode(body, bodyLength);
+                                } else {
+                                    Log.w(TAG, "MediaCodec not ready, skipping decode");
+                                }
                             }
                         } catch (IOException e) {
                             if (receivie && !Thread.currentThread().isInterrupted()) {
@@ -207,26 +238,46 @@ public class MediaDecoder {
     }
 
     private void decode(byte[] data, int length) throws Exception {
+        if (mediaCodec == null) {
+            Log.e(TAG, "MediaCodec is null, cannot decode");
+            return;
+        }
 
         // Log.i(TAG, "decode length:" + length + " isComplete:" + isComplete + "
         // isKeyFrame:" + isKeyFrame + " nalu:" + nalu);
         int inputBufferIndex = mediaCodec.dequeueInputBuffer(0);
         if (inputBufferIndex >= 0) {
             ByteBuffer inputBuffer = mediaCodec.getInputBuffer(inputBufferIndex);
-            inputBuffer.clear();
-            inputBuffer.put(data, 0, length);
-            mediaCodec.queueInputBuffer(inputBufferIndex, 0, length, computePresentationTime(inputBufferIndex), 0);
+            if (inputBuffer != null) {
+                inputBuffer.clear();
+                inputBuffer.put(data, 0, length);
+                mediaCodec.queueInputBuffer(inputBufferIndex, 0, length, computePresentationTime(inputBufferIndex), 0);
+            } else {
+                Log.w(TAG, "Input buffer is null for index: " + inputBufferIndex);
+                return;
+            }
+        } else {
+            Log.w(TAG, "No input buffer available: " + inputBufferIndex);
+            return;
         }
 
         MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
         int outputBufferIndex = mediaCodec.dequeueOutputBuffer(bufferInfo, 10);
-        Log.i(TAG, "outputBufferIndex:" + outputBufferIndex + " savePng:" + savePng);
+        Log.i("outputBufferIndex", "outputBufferIndex:" + outputBufferIndex + " savePng:" + savePng);
+
+        int loopCount = 0;
         while (true) {
+            loopCount++;
+            if (loopCount > 10) { // Prevent infinite loops
+                Log.w(TAG, "Breaking decode loop after 10 iterations");
+                break;
+            }
+
             if (!receivie) {
                 break;
             }
-            if (outputBufferIndex >= 0) {
 
+            if (outputBufferIndex >= 0) {
                 if (savePng) {
                     ByteBuffer outputBuffer = mediaCodec.getOutputBuffer(outputBufferIndex);
                     Log.i(TAG, "saveFrameAsJPEG:" + outputBufferIndex);
@@ -256,7 +307,12 @@ public class MediaDecoder {
                 }
                 break;
             } else if (outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-
+                break;
+            } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED) {
+                Log.i(TAG, "Output buffers changed");
+                break;
+            } else {
+                Log.w(TAG, "Unexpected output buffer index: " + outputBufferIndex);
                 break;
             }
         }
@@ -294,25 +350,37 @@ public class MediaDecoder {
         // Stop TCP server first
         stopTCPServer();
 
-        // Stop and release MediaCodec
+        // Stop and release MediaCodec with proper state checking
         if (mediaCodec != null) {
             try {
+                // Flush any pending operations
+                mediaCodec.flush();
+                Log.i(TAG, "MediaCodec flushed");
+
+                // Stop the codec
                 mediaCodec.stop();
+                Log.i(TAG, "MediaCodec stopped");
+
+                // Release the codec
                 mediaCodec.release();
+                Log.i(TAG, "MediaCodec released");
             } catch (Exception e) {
                 Log.e(TAG, "Error releasing MediaCodec", e);
+            } finally {
+                mediaCodec = null;
             }
-            mediaCodec = null;
         }
 
         // Clean up FBOPlugin
         if (mFBOPlugin != null) {
             try {
                 mFBOPlugin.release(); // Assume FBOPlugin has a release method
+                Log.i(TAG, "FBOPlugin released");
             } catch (Exception e) {
                 Log.w(TAG, "Error releasing FBOPlugin (method may not exist)", e);
+            } finally {
+                mFBOPlugin = null;
             }
-            mFBOPlugin = null;
         }
 
         // Reset state variables
@@ -339,15 +407,19 @@ public class MediaDecoder {
         Log.i(TAG, "stopTCPServer");
         receivie = false;
 
-        if (tcpThread != null && tcpThread.isAlive()) {
+        if (tcpThread != null) {
+            tcpThread.interrupt(); // Interrupt the thread if it's blocking on I/O
             try {
-                tcpThread.interrupt();
-                tcpThread.join(1000); // Wait up to 1 second for thread to finish
+                tcpThread.join(100); // Wait for the thread to die for up to 0.1 seconds
+                if (tcpThread.isAlive()) {
+                    Log.w(TAG, "TCP thread did not terminate in time. Forcing shutdown...");
+                    // You might want to take additional action here, like closing sockets
+                } else {
+                    Log.i(TAG, "TCP thread stopped successfully.");
+                }
             } catch (InterruptedException e) {
-                Log.w(TAG, "Interrupted while waiting for TCP thread to stop", e);
-                Thread.currentThread().interrupt(); // Restore interrupt status
+                Log.e(TAG, "Interrupted while waiting for TCP thread to stop.", e);
             }
-            tcpThread = null;
         }
 
         // Close file output stream if open
@@ -356,8 +428,16 @@ public class MediaDecoder {
                 fileOutputStream.close();
             } catch (IOException e) {
                 Log.e(TAG, "Error closing fileOutputStream", e);
+            } finally {
+                fileOutputStream = null;
             }
-            fileOutputStream = null;
         }
+    }
+
+    /**
+     * Check if MediaCodec is in a valid state for decoding
+     */
+    private boolean isMediaCodecReady() {
+        return mediaCodec != null;
     }
 }
