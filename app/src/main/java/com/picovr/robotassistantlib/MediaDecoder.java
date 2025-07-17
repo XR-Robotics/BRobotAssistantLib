@@ -106,9 +106,9 @@ public class MediaDecoder {
 
     private byte[] buffer;
 
-    public void startTCPServer(int port, boolean record) throws IOException {
+    public void startServer(int port, boolean record) throws IOException {
         // Stop existing TCP server if running
-        stopTCPServer();
+        stopServer();
 
         receivie = true;
         Log.i(TAG, "startTCPServer:" + port);
@@ -348,7 +348,7 @@ public class MediaDecoder {
         Log.i(TAG, "mediaCodec release");
 
         // Stop TCP server first
-        stopTCPServer();
+        stopServer();
 
         // Stop and release MediaCodec with proper state checking
         if (mediaCodec != null) {
@@ -403,7 +403,7 @@ public class MediaDecoder {
     /**
      * Stop the TCP server and clean up resources
      */
-    public void stopTCPServer() {
+    public void stopServer() {
         Log.i(TAG, "stopTCPServer");
         receivie = false;
 
