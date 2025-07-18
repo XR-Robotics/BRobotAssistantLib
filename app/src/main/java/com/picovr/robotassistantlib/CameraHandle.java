@@ -24,8 +24,10 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.TimeZone;
 
+import com.picoxr.fbolibrary.FBOPlugin;
+
 public class CameraHandle {
-    private final String TAG = "CameraHandle";
+    private final String TAG = "CameraHandlee";
     private UseState useState = UseState.IDLE;
     private int mEnableMvHevc = 0;
     private int mVideoFps = 60;
@@ -46,6 +48,10 @@ public class CameraHandle {
     private int trackIndex;
     private boolean isMuxerStarted = false;
     private volatile boolean shouldStopEncoding = false; // Flag to signal encoding thread to stop
+
+    // Fields for texture rendering
+    private FBOPlugin mFBOPlugin = null;
+    private int previewTextureId;
 
     public int GetCaptureState() {
         return mCaptureState;
@@ -108,7 +114,17 @@ public class CameraHandle {
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
             mediaEncode.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             Log.i(TAG, "StartPreview  setConfigure");
-            surface = mediaEncode.createInputSurface();
+
+            // Use FBOPlugin surface for texture rendering if available, otherwise use
+            // encoder surface
+            if (mFBOPlugin != null) {
+                surface = mFBOPlugin.getSurface();
+                Log.i(TAG, "Using FBOPlugin surface for texture rendering");
+            } else {
+                surface = mediaEncode.createInputSurface();
+                Log.i(TAG, "Using MediaCodec surface (FBOPlugin not initialized)");
+            }
+
             MediaCodecInfo.CodecCapabilities capabilities = mediaEncode.getCodecInfo()
                     .getCapabilitiesForType("video/avc");
             for (int colorFormat : capabilities.colorFormats) {
@@ -330,6 +346,52 @@ public class CameraHandle {
         return outputBuffer;
     }
 
+    public void initializeTexture(int unityTextureId, int width, int height) throws Exception {
+        Log.i(TAG, "initialize: textureId=" + unityTextureId + ", size=" + width + "x" + height);
+
+        // Clean up any existing resources first
+        if (mFBOPlugin != null) {
+            Log.i(TAG, "Cleaning up existing FBOPlugin before reinitializing");
+            try {
+                mFBOPlugin.release();
+            } catch (Exception e) {
+                Log.w(TAG, "Error releasing existing FBOPlugin", e);
+            }
+            mFBOPlugin = null;
+            // Add a small delay to ensure proper cleanup
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        this.previewTextureId = unityTextureId;
+        this.previewWidth = width;
+        this.previewHeight = height;
+
+        // Initialize FBOPlugin
+        mFBOPlugin = new FBOPlugin();
+        mFBOPlugin.init();
+        mFBOPlugin.BuildTexture(unityTextureId, width, height);
+
+        Log.i(TAG, "CameraHandle initialized successfully with texture rendering");
+    }
+
+    public boolean isUpdateFrame() {
+        if (mFBOPlugin != null) {
+            return mFBOPlugin.isUpdateFrame();
+        }
+        return false;
+    }
+
+    public void updateTexture() {
+        // Update SurfaceTexture
+        if (mFBOPlugin != null && isUpdateFrame()) {
+            mFBOPlugin.updateTexture();
+        }
+    }
+
     public int StopPreview() {
         Log.i(TAG, "StopPreview starting...");
 
@@ -385,6 +447,18 @@ public class CameraHandle {
             mediaMuxer = null;
         }
 
+        // Clean up FBOPlugin
+        if (mFBOPlugin != null) {
+            try {
+                mFBOPlugin.release();
+                Log.i(TAG, "FBOPlugin released");
+            } catch (Exception e) {
+                Log.w(TAG, "Error releasing FBOPlugin", e);
+            } finally {
+                mFBOPlugin = null;
+            }
+        }
+
         // Clean up surface
         if (surface != null) {
             surface.release();
@@ -398,6 +472,7 @@ public class CameraHandle {
         isMuxerStarted = false;
         trackIndex = -1;
         shouldStopEncoding = false; // Reset for next streaming session
+        previewTextureId = 0;
 
         // IMPORTANT: Reset camera completely to allow reopening
         try {
@@ -492,6 +567,7 @@ public class CameraHandle {
         trackIndex = -1;
         isMuxerStarted = false;
         targetPort = 0; // Reset to indicate no active connection
+        previewTextureId = 0;
         Log.i(TAG, "State reset completed");
     }
 
@@ -596,6 +672,18 @@ public class CameraHandle {
             if (surface != null) {
                 surface.release();
                 surface = null;
+            }
+
+            // Clean up FBOPlugin
+            if (mFBOPlugin != null) {
+                try {
+                    mFBOPlugin.release();
+                    Log.i(TAG, "FBOPlugin released during cleanup");
+                } catch (Exception e) {
+                    Log.w(TAG, "Error releasing FBOPlugin during cleanup", e);
+                } finally {
+                    mFBOPlugin = null;
+                }
             }
 
         } catch (Exception e) {
