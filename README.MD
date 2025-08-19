@@ -102,3 +102,16 @@ app/build/outputs/aar/
 - `getDecoderError`: Retrieve error codes
 - `initialize`: Setup decoder
 - `startDecoding`: Launch decoding thread
+
+## Citation
+
+If you find this project useful, please consider citing it as follows.
+
+```
+@article{zhao2025xrobotoolkit,
+      title={XRoboToolkit: A Cross-Platform Framework for Robot Teleoperation}, 
+      author={Zhigen Zhao and Liuchuan Yu and Ke Jing and Ning Yang}, 
+      journal={arXiv preprint arXiv:2508.00097},
+      year={2025}
+}
+```
