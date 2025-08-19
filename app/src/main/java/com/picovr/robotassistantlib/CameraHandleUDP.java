@@ -12,9 +12,10 @@ import com.pxr.capturelib.PXRCamera;
 import com.pxr.capturelib.PXRCameraCallBack;
 
 import java.io.IOException;
-import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.text.SimpleDateFormat;
@@ -24,10 +25,8 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.TimeZone;
 
-import com.picoxr.fbolibrary.FBOPlugin;
-
-public class CameraHandle {
-    private final String TAG = "CameraHandlee";
+public class CameraHandleUDP {
+    private final String TAG = "CameraHandleUDPe";
     private UseState useState = UseState.IDLE;
     private int mEnableMvHevc = 0;
     private int mVideoFps = 60;
@@ -39,8 +38,8 @@ public class CameraHandle {
     private int renderMode;
     private Thread encodeThread;
     private MediaCodec mediaEncode;
-    private Socket socket;
-    private OutputStream outputStream;
+    private DatagramSocket udpSocket;
+    private InetAddress targetAddress;
     private Surface surface;
     private String targetIp = "192.168.31.228"; // Target IP
     private int targetPort = 12345; // target port
@@ -48,10 +47,6 @@ public class CameraHandle {
     private int trackIndex;
     private boolean isMuxerStarted = false;
     private volatile boolean shouldStopEncoding = false; // Flag to signal encoding thread to stop
-
-    // Fields for texture rendering
-    private FBOPlugin mFBOPlugin = null;
-    private int previewTextureId;
 
     public int GetCaptureState() {
         return mCaptureState;
@@ -114,17 +109,7 @@ public class CameraHandle {
             format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
             mediaEncode.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             Log.i(TAG, "StartPreview  setConfigure");
-
-            // Use FBOPlugin surface for texture rendering if available, otherwise use
-            // encoder surface
-            if (mFBOPlugin != null) {
-                surface = mFBOPlugin.getSurface();
-                Log.i(TAG, "Using FBOPlugin surface for texture rendering");
-            } else {
-                surface = mediaEncode.createInputSurface();
-                Log.i(TAG, "Using MediaCodec surface (FBOPlugin not initialized)");
-            }
-
+            surface = mediaEncode.createInputSurface();
             MediaCodecInfo.CodecCapabilities capabilities = mediaEncode.getCodecInfo()
                     .getCapabilitiesForType("video/avc");
             for (int colorFormat : capabilities.colorFormats) {
@@ -160,14 +145,17 @@ public class CameraHandle {
             @Override
             public void run() {
                 try {
-                    Log.i(TAG, "StartPreview  socket start " + targetIp + " " + targetPort);
-                    socket = new Socket();
-                    socket.connect(new InetSocketAddress(targetIp, targetPort), 5000);
-                    outputStream = socket.getOutputStream();
+                    Log.i(TAG, "StartPreview UDP socket start " + targetIp + " " + targetPort);
+                    // Create UDP socket without binding to a specific local port
+                    // This allows the system to choose an available ephemeral port
+                    udpSocket = new DatagramSocket();
+                    // Enable socket reuse to prevent "Address already in use" errors
+                    udpSocket.setReuseAddress(true);
+                    targetAddress = InetAddress.getByName(targetIp);
                     EncodeStreaming(true);
                     Log.i(TAG, "startStreaming");
                 } catch (IOException e) {
-                    Log.e(TAG, "Socket connection failed", e);
+                    Log.e(TAG, "UDP socket creation failed", e);
 
                     // Properly handle cleanup on failure
                     useState = UseState.IDLE;
@@ -180,7 +168,7 @@ public class CameraHandle {
                             }
                         }
                     } catch (Exception cleanupException) {
-                        Log.e(TAG, "Error during cleanup after socket failure", cleanupException);
+                        Log.e(TAG, "Error during cleanup after UDP socket failure", cleanupException);
                     }
                     cleanup();
                 }
@@ -207,10 +195,10 @@ public class CameraHandle {
         return 0;
     }
 
-    public void EncodeStreaming(boolean tcpSend) {
+    public void EncodeStreaming(boolean udpSend) {
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
 
-        Log.i(TAG, "startStreaming tcpSend:" + tcpSend + " useState:" + useState);
+        Log.i(TAG, "startStreaming udpSend:" + udpSend + " useState:" + useState);
         while (useState == UseState.Preview && !Thread.currentThread().isInterrupted() && !shouldStopEncoding) {
             try {
                 int outputBufferIndex;
@@ -241,7 +229,7 @@ public class CameraHandle {
                             break;
                         }
                     }
-                    if (tcpSend) {
+                    if (udpSend) {
                         int bodyLength = encodedData.remaining();
                         byte[] data = new byte[bodyLength];
                         encodedData.get(data);
@@ -254,13 +242,21 @@ public class CameraHandle {
 
                         buffer.put(data);
                         byte[] packet = buffer.array();
-                        // Check if the Socket is connected properly
-                        if (socket != null && socket.isConnected()) {
-                            outputStream.write(packet);
-                            outputStream.flush();
+                        // Send UDP packet using same format as TCP
+                        if (udpSocket != null && !udpSocket.isClosed() && targetAddress != null) {
+                            // Check UDP packet size limitation (typical max is 65507 bytes)
+                            final int MAX_UDP_PACKET_SIZE = 65507;
+                            if (packet.length <= MAX_UDP_PACKET_SIZE) {
+                                DatagramPacket udpPacket = new DatagramPacket(packet, packet.length, targetAddress,
+                                        targetPort);
+                                udpSocket.send(udpPacket);
+                            } else {
+                                Log.w(TAG, "Packet size " + packet.length + " exceeds UDP limit of "
+                                        + MAX_UDP_PACKET_SIZE + " bytes, dropping packet");
+                            }
                         } else {
-                            Log.i(TAG, "Socket connection disconnected, try reconnecting...");
-                            reconnectSocket();
+                            Log.i(TAG, "UDP socket not available, trying to recreate...");
+                            recreateUdpSocket();
                         }
                     } else {
                         if (encodedData != null && isMuxerStarted) {
@@ -286,7 +282,7 @@ public class CameraHandle {
                     continue;
                 } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     // Output format changes (such as when the encoder is reinitialized)
-                    if (!tcpSend) {
+                    if (!udpSend) {
                         synchronized (mediaEncodeLock) {
                             if (mediaEncode == null || useState != UseState.Preview) {
                                 Log.i(TAG, "MediaCodec is null or state changed during format change");
@@ -311,7 +307,7 @@ public class CameraHandle {
 
             } catch (IOException e) {
                 e.printStackTrace();
-                reconnectSocket(); // Attempt to reconnect when an exception occurs
+                recreateUdpSocket(); // Attempt to recreate UDP socket when an exception occurs
             }
         }
         Log.i(TAG, "EncodeStreaming loop ended - useState: " + useState + ", shouldStopEncoding: " + shouldStopEncoding
@@ -344,52 +340,6 @@ public class CameraHandle {
         outputBuffer.flip();
 
         return outputBuffer;
-    }
-
-    public void initializeTexture(int unityTextureId, int width, int height) throws Exception {
-        Log.i(TAG, "initialize: textureId=" + unityTextureId + ", size=" + width + "x" + height);
-
-        // Clean up any existing resources first
-        if (mFBOPlugin != null) {
-            Log.i(TAG, "Cleaning up existing FBOPlugin before reinitializing");
-            try {
-                mFBOPlugin.release();
-            } catch (Exception e) {
-                Log.w(TAG, "Error releasing existing FBOPlugin", e);
-            }
-            mFBOPlugin = null;
-            // Add a small delay to ensure proper cleanup
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-
-        this.previewTextureId = unityTextureId;
-        this.previewWidth = width;
-        this.previewHeight = height;
-
-        // Initialize FBOPlugin
-        mFBOPlugin = new FBOPlugin();
-        mFBOPlugin.init();
-        mFBOPlugin.BuildTexture(unityTextureId, width, height);
-
-        Log.i(TAG, "CameraHandle initialized successfully with texture rendering");
-    }
-
-    public boolean isUpdateFrame() {
-        if (mFBOPlugin != null) {
-            return mFBOPlugin.isUpdateFrame();
-        }
-        return false;
-    }
-
-    public void updateTexture() {
-        // Update SurfaceTexture
-        if (mFBOPlugin != null && isUpdateFrame()) {
-            mFBOPlugin.updateTexture();
-        }
     }
 
     public int StopPreview() {
@@ -447,18 +397,6 @@ public class CameraHandle {
             mediaMuxer = null;
         }
 
-        // Clean up FBOPlugin
-        if (mFBOPlugin != null) {
-            try {
-                mFBOPlugin.release();
-                Log.i(TAG, "FBOPlugin released");
-            } catch (Exception e) {
-                Log.w(TAG, "Error releasing FBOPlugin", e);
-            } finally {
-                mFBOPlugin = null;
-            }
-        }
-
         // Clean up surface
         if (surface != null) {
             surface.release();
@@ -466,13 +404,12 @@ public class CameraHandle {
         }
 
         // Clean up socket connection
-        cleanupSocket();
+        cleanupUdpSocket();
 
         // Reset state variables
         isMuxerStarted = false;
         trackIndex = -1;
         shouldStopEncoding = false; // Reset for next streaming session
-        previewTextureId = 0;
 
         // IMPORTANT: Reset camera completely to allow reopening
         try {
@@ -560,14 +497,13 @@ public class CameraHandle {
         mCaptureState = PXRCamera.PXRCaptureState.CAPTURE_STATE_IDLE.ordinal();
         encodeThread = null;
         mediaEncode = null;
-        socket = null;
-        outputStream = null;
+        udpSocket = null;
+        targetAddress = null;
         surface = null;
         mediaMuxer = null;
         trackIndex = -1;
         isMuxerStarted = false;
         targetPort = 0; // Reset to indicate no active connection
-        previewTextureId = 0;
         Log.i(TAG, "State reset completed");
     }
 
@@ -605,51 +541,44 @@ public class CameraHandle {
         IDLE, Preview, Record
     }
 
-    private void reconnectSocket() {
+    private void recreateUdpSocket() {
         if (useState != UseState.Preview) {
             return;
         }
-        // Try reconnecting the Socket
+        // Try recreating the UDP socket
         try {
             synchronized (mediaEncodeLock) {
-                // Clean up existing connection
-                if (outputStream != null) {
-                    try {
-                        outputStream.close();
-                    } catch (IOException e) {
-                        Log.e(TAG, "Error closing output stream", e);
-                    }
-                    outputStream = null;
+                // Clean up existing socket
+                if (udpSocket != null && !udpSocket.isClosed()) {
+                    udpSocket.close();
                 }
 
-                if (socket != null && !socket.isClosed()) {
-                    socket.close();
+                // Create new UDP socket with better error handling
+                udpSocket = new DatagramSocket();
+                // Enable socket reuse to prevent "Address already in use" errors
+                udpSocket.setReuseAddress(true);
+                if (targetIp != null) {
+                    targetAddress = InetAddress.getByName(targetIp);
                 }
-
-                // Create new connection
-                socket = new Socket();
-                socket.connect(new InetSocketAddress(targetIp, targetPort), 5000);
-                outputStream = socket.getOutputStream();
-                Log.i(TAG, "Socket reconnected successfully!");
+                Log.i(TAG, "UDP socket recreated successfully!");
             }
         } catch (IOException e) {
-            Log.e(TAG, "Reconnect failed, please check your network connection", e);
+            Log.e(TAG, "UDP socket recreation failed, please check your network connection", e);
         }
     }
 
-    private void cleanupSocket() {
+    private void cleanupUdpSocket() {
         try {
-            if (outputStream != null) {
-                outputStream.close();
-                outputStream = null;
+            if (udpSocket != null) {
+                if (!udpSocket.isClosed()) {
+                    udpSocket.close();
+                }
+                udpSocket = null;
             }
-            if (socket != null && !socket.isClosed()) {
-                socket.close();
-                socket = null;
-            }
-            Log.i(TAG, "Socket cleanup completed");
-        } catch (IOException e) {
-            Log.e(TAG, "Error during socket cleanup", e);
+            targetAddress = null;
+            Log.i(TAG, "UDP socket cleanup completed");
+        } catch (Exception e) {
+            Log.e(TAG, "Error during UDP socket cleanup", e);
         }
     }
 
@@ -667,23 +596,11 @@ public class CameraHandle {
                 }
             }
 
-            cleanupSocket();
+            cleanupUdpSocket();
 
             if (surface != null) {
                 surface.release();
                 surface = null;
-            }
-
-            // Clean up FBOPlugin
-            if (mFBOPlugin != null) {
-                try {
-                    mFBOPlugin.release();
-                    Log.i(TAG, "FBOPlugin released during cleanup");
-                } catch (Exception e) {
-                    Log.w(TAG, "Error releasing FBOPlugin during cleanup", e);
-                } finally {
-                    mFBOPlugin = null;
-                }
             }
 
         } catch (Exception e) {

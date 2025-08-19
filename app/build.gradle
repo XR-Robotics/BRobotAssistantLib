@@ -56,7 +56,8 @@ android {
 archivesBaseName = "robotassistant_lib"
 
 dependencies {
-    implementation fileTree(include: ['*.jar', '*.aar'], dir: 'libs')
+    // implementation fileTree(include: ['*.jar', '*.aar'], dir: 'libs') // large size
+    compileOnly fileTree(include: ['*.jar', '*.aar'], dir: 'libs') // small size, need copy the following files
     // 添加编译好的aar文件（需要先将fbolibrary生成的aar复制到app/libs目录）
     implementation 'com.pxr:capturelib:0.0.7'
     implementation 'com.pxr:fbolibrary:1.0.0'
